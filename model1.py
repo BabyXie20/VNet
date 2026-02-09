@@ -265,7 +265,7 @@ class WaveletWindowCrossAttention3D(nn.Module):
     def forward(self, query_map: torch.Tensor, memory_map: torch.Tensor) -> torch.Tensor:
         """
         query_map:  (B,C,D,H,W)
-        memory_map: (B,C,D,H,W)  (here it is already SpatialEnhance3D-enhanced skip, but KV uses only freq)
+        memory_map: (B,C,D,H,W)  (skip_raw for KV frequency tokens)
         """
         B, C, D, H, W = query_map.shape
         ws = self.window_size
@@ -330,7 +330,7 @@ class WaveletWindowCrossAttention3D(nn.Module):
 class WaveletWindowCrossFusion3D(nn.Module):
     """
     Fuse:
-      y_attn = WaveletWindowCrossAttention3D(query, skip_enhanced)   (KV uses only frequency)
+      y_attn = WaveletWindowCrossAttention3D(query, skip_raw)        (KV uses only frequency)
       y_spa  = query + skip_enhanced                                (pure spatial skip fusion)
       out    = SEFuse2Branch3D(y_attn, y_spa)
     """
@@ -345,8 +345,8 @@ class WaveletWindowCrossFusion3D(nn.Module):
         )
         self.se_fuse = SEFuse2Branch3D(d_model, reduction=se_reduction, use_softmax=True)
 
-    def forward(self, query_map: torch.Tensor, skip_enhanced: torch.Tensor) -> torch.Tensor:
-        y_attn = self.cross(query_map, skip_enhanced)
+    def forward(self, query_map: torch.Tensor, skip_enhanced: torch.Tensor, skip_raw: torch.Tensor) -> torch.Tensor:
+        y_attn = self.cross(query_map, skip_raw)
         y_spa = query_map + skip_enhanced
         return self.se_fuse(y_attn, y_spa)
 
@@ -519,23 +519,27 @@ class Encoder(nn.Module):
         self.se4 = SpatialEnhance3D(n_filters * 8, kernel_size=11)
 
     def forward(self, input):
-        x1 = self.se1(self.block_one(input))
+        x1_raw = self.block_one(input)
+        x1 = self.se1(x1_raw)
         x1_dw = self.block_one_dw(x1)
 
-        x2 = self.se2(self.block_two(x1_dw))
+        x2_raw = self.block_two(x1_dw)
+        x2 = self.se2(x2_raw)
         x2_dw = self.block_two_dw(x2)
 
-        x3 = self.se3(self.block_three(x2_dw))
+        x3_raw = self.block_three(x2_dw)
+        x3 = self.se3(x3_raw)
         x3_dw = self.block_three_dw(x3)
 
-        x4 = self.se4(self.block_four(x3_dw))
+        x4_raw = self.block_four(x3_dw)
+        x4 = self.se4(x4_raw)
         x4_dw = self.block_four_dw(x4)
 
         x5 = self.block_five(x4_dw)
         if self.has_dropout:
             x5 = self.dropout(x5)
 
-        return [x1, x2, x3, x4, x5]
+        return [x1, x2, x3, x4], [x1_raw, x2_raw, x3_raw, x4_raw], x5
 
 
 class Decoder(nn.Module):
@@ -576,22 +580,24 @@ class Decoder(nn.Module):
         )
 
     def forward(self, features):
-        x1, x2, x3, x4, x5 = features
+        enhanced_skips, raw_skips, x5 = features
+        x1, x2, x3, x4 = enhanced_skips
+        r1, r2, r3, r4 = raw_skips
 
         x5_up = self.block_five_up(x5)
-        x5_up = self.fuse_x4(x5_up, x4)
+        x5_up = self.fuse_x4(x5_up, x4, r4)
 
         x6 = self.block_six(x5_up)
         x6_up = self.block_six_up(x6)
-        x6_up = self.fuse_x3(x6_up, x3)
+        x6_up = self.fuse_x3(x6_up, x3, r3)
 
         x7 = self.block_seven(x6_up)
         x7_up = self.block_seven_up(x7)
-        x7_up = self.fuse_x2(x7_up, x2)
+        x7_up = self.fuse_x2(x7_up, x2, r2)
 
         x8 = self.block_eight(x7_up)
         x8_up = self.block_eight_up(x8)
-        x8_up = self.fuse_x1(x8_up, x1)
+        x8_up = self.fuse_x1(x8_up, x1, r1)
 
         x9 = self.block_nine(x8_up)
         if self.has_dropout:
