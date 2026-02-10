@@ -1,354 +1,267 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple
+from __future__ import annotations
 import math
+from typing import Literal, Optional, Tuple
 import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+from monai.networks.nets.swin_unetr import SwinTransformerBlock
+from monai.networks.nets import swin_unetr
 
-def _gn_groups(C: int) -> int:
-    for g in [16, 8, 4, 2]:
-        if C % g == 0:
-            return g
-    return 1
+
+NormType = Optional[Literal["batchnorm", "groupnorm", "instancenorm", "none"]]
 
 
-class SEFuse2Branch3D(nn.Module):
+def _best_group_count(num_channels: int, preferred: int = 16) -> int:
+    g = min(preferred, num_channels)
+    while g > 1 and (num_channels % g) != 0:
+        g -= 1
+    return g
+
+
+def norm3d(norm: NormType, num_channels: int, affine: bool = True) -> nn.Module:
+    if norm == "batchnorm":
+        return nn.BatchNorm3d(num_channels)
+    if norm == "groupnorm":
+        num_groups = _best_group_count(num_channels, preferred=16)
+        return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+    if norm == "instancenorm":
+        return nn.InstanceNorm3d(num_channels, affine=affine)
+    if norm in ("none", None):
+        return nn.Identity()
+    raise ValueError(f"Unknown normalization: {norm}")
+
+
+def _haar_pair():
+    s2 = math.sqrt(2.0)
+    L = torch.tensor([1., 1.]) / s2
+    H = torch.tensor([1., -1.]) / s2
+    return L, H
+
+
+def _kron3(a, b, c):
+    return torch.einsum('i,j,k->ijk', a, b, c)
+
+
+def _build_haar_3d_kernels(device):
+    L, H = _haar_pair()
+    taps = []
+    for zf in [L, H]:
+        for yf in [L, H]:
+            for xf in [L, H]:
+                taps.append(_kron3(zf, yf, xf))  # [2, 2, 2]
+    k = torch.stack(taps, dim=0)[:, None, ...]  # [8, 1, 2, 2, 2]
+    stride = (2, 2, 2)
+    ksize = (2, 2, 2)
+    return k.to(device), stride, ksize
+
+
+class DWT3D(nn.Module):
     """
-    SE-style fusion for two same-shape feature maps (B,C,D,H,W).
-    - squeeze: GAP over DHW
-    - excite: produce branch-wise channel weights
-    - use softmax across branches for stable competition (SK-style branch selection) :contentReference[oaicite:2]{index=2}
-      while still being SE-like channel recalibration :contentReference[oaicite:3]{index=3}
+    3D 离散小波变换 (Discrete Wavelet Transform) - Haar
+    输入:  x: [B, C, D, H, W]
+    输出:  low:   [B, C, D/2, H/2, W/2]
+           highs: [B, C, 7,   D/2, H/2, W/2]
     """
-    def __init__(self, channels: int, reduction: int = 16, use_softmax: bool = True):
+    def __init__(self):
         super().__init__()
-        self.use_softmax = use_softmax
-        hidden = max((2 * channels) // reduction, 1)
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.fc1 = nn.Conv3d(2 * channels, hidden, 1, bias=True)
-        self.act = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv3d(hidden, 2 * channels, 1, bias=True)
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # a,b: (B,C,D,H,W)
-        z = torch.cat([a, b], dim=1)               # (B,2C,D,H,W)
-        s = self.pool(z)                           # (B,2C,1,1,1)
-        w = self.fc2(self.act(self.fc1(s)))        # (B,2C,1,1,1)
-
-        B, _, _, _, _ = w.shape
-        C = a.shape[1]
-        w = w.view(B, 2, C, 1, 1, 1)               # (B,2,C,1,1,1)
-
-        if self.use_softmax:
-            w = torch.softmax(w, dim=1)            # branch-competition weights
-        else:
-            w = torch.sigmoid(w)
-            w = w / (w.sum(dim=1, keepdim=True) + 1e-6)
-
-        return w[:, 0] * a + w[:, 1] * b
-
-
-class SpatialEnhance3D(nn.Module):
-    def __init__(self, channels: int, kernel_size: int = 7):
-        super().__init__()
-        k = kernel_size
-        pad = k // 2
-        g = channels  # depthwise
-
-        self.dw_large = nn.Conv3d(channels, channels, kernel_size=k, padding=pad, groups=g, bias=False)
-        self.dw_strip_d = nn.Conv3d(channels, channels, kernel_size=(k, 1, 1), padding=(pad, 0, 0), groups=g, bias=False)
-        self.dw_strip_h = nn.Conv3d(channels, channels, kernel_size=(1, k, 1), padding=(0, pad, 0), groups=g, bias=False)
-        self.dw_strip_w = nn.Conv3d(channels, channels, kernel_size=(1, 1, k), padding=(0, 0, pad), groups=g, bias=False)
-
-        self.pw = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.norm = nn.GroupNorm(num_groups=_gn_groups(channels), num_channels=channels)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.dw_large(x) + self.dw_strip_d(x) + self.dw_strip_h(x) + self.dw_strip_w(x)
-        y = self.pw(y)
-        y = self.norm(y)
-        y = self.act(y)
-        return x + y
-
-
-# -------- 3D Haar DWT filters (fixed) --------
-def get_wav3d(in_channels: int, pool: bool = True, stride: Tuple[int, int, int] = (2, 2, 2)):
-    L = (1 / np.sqrt(2)) * np.array([1.0, 1.0], dtype=np.float32)
-    H = (1 / np.sqrt(2)) * np.array([-1.0, 1.0], dtype=np.float32)
-
-    def outer3(a, b, c):
-        return np.einsum("i,j,k->ijk", a, b, c)
-
-    filters = [
-        outer3(L, L, L), outer3(L, L, H), outer3(L, H, L), outer3(L, H, H),
-        outer3(H, L, L), outer3(H, L, H), outer3(H, H, L), outer3(H, H, H),
-    ]
-    filters = [torch.from_numpy(f).unsqueeze(0).unsqueeze(0) for f in filters]  # (1,1,2,2,2)
-    net = nn.Conv3d if pool else nn.ConvTranspose3d
-
-    convs = []
-    for _ in range(8):
-        convs.append(
-            net(in_channels, in_channels, kernel_size=2, stride=stride, padding=0, bias=False, groups=in_channels)
-        )
-
-    for conv, f in zip(convs, filters):
-        conv.weight.requires_grad_(False)
-        conv.weight.data = f.float().expand(in_channels, 1, 2, 2, 2).clone()
-
-    return convs
-
-
-class WavePool3D(nn.Module):
-    def __init__(self, in_channels: int, stride: Tuple[int, int, int] = (2, 2, 2)):
-        super().__init__()
-        convs = get_wav3d(in_channels, pool=True, stride=stride)
-        (self.LLL, self.LLH, self.LHL, self.LHH,
-         self.HLL, self.HLH, self.HHL, self.HHH) = convs
+        k, stride, ksize = _build_haar_3d_kernels(device=torch.device('cpu'))
+        # k: [8, 1, 2, 2, 2]
+        self.register_buffer("kernels", k)  
+        self.stride = stride                 
+        self.ksize = ksize                   
 
     def forward(self, x: torch.Tensor):
-        return (self.LLL(x), self.LLH(x), self.LHL(x), self.LHH(x),
-                self.HLL(x), self.HLH(x), self.HHL(x), self.HHH(x))
+        """
+        x: [B, C, D, H, W]
+        """
+        B, C, D, H, W = x.shape
+        S = self.kernels.shape[0]           # 8
+        # [C*8, 1, 2,2,2]
+        weight = self.kernels.repeat(C, 1, 1, 1, 1)
+
+        # groups=C 的分组卷积
+        y = F.conv3d(x, weight, stride=self.stride, padding=0, groups=C)
+        # y: [B, C*8, D/2, H/2, W/2]
+
+        y = y.view(B, C, S, *y.shape[-3:])  # [B, C, 8, D/2, H/2, W/2]
+        low = y[:, :, :1, ...].squeeze(2)   # [B, C, D/2, H/2, W/2]
+        highs = y[:, :, 1:, ...]            # [B, C, 7, D/2, H/2, W/2]
+        return low, highs
 
 
-class MSCM(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.local_attn = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, d_model))
-        self.global_attn = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, d_model))
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        g = x.mean(dim=1, keepdim=True)
-        w = self.local_attn(x) + self.global_attn(g)
-        return self.sigmoid(w)
-
-
-class WaveletMSCMFusion3D(nn.Module):
+class IDWT3D(nn.Module):
     """
-    Frequency-only KV pre.
-    Return:
-      fre_tokens: (B, N', C)
-      (Dp,Hp,Wp): pooled size
+    3D 逆离散小波变换 (Inverse DWT) - Haar
+    输入:
+        low:   [B, C, D', H', W']
+        highs: [B, C, 7, D', H', W']
+    输出:
+        x: [B, C, 2D', 2H', 2W']
     """
-    def __init__(self, channels: int, stride=(2, 2, 2)):
+    def __init__(self):
         super().__init__()
-        self.dwt = WavePool3D(channels, stride=stride)
-        self.mscm = MSCM(d_model=channels)
+        k, stride, ksize = _build_haar_3d_kernels(device=torch.device('cpu'))
+        self.register_buffer("kernels", k)   # [8, 1, 2, 2, 2]
+        self.stride = stride
+        self.ksize = ksize
 
-    def forward(self, feat_map: torch.Tensor):
-        (LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH) = self.dwt(feat_map)
-        low = LLL
-        high = LLH + LHL + LHH + HLL + HLH + HHL + HHH
-
+    def forward(self, low: torch.Tensor, highs: torch.Tensor):
+        """
+        low:   [B, C, D', H', W']
+        highs: [B, C, 7, D', H', W']
+        """
         B, C, Dp, Hp, Wp = low.shape
-        low_t = low.flatten(2).transpose(1, 2)
-        high_t = high.flatten(2).transpose(1, 2)
+        S = self.kernels.shape[0]           # 8
 
-        w = self.mscm(high_t + low_t)
-        fre = (w * high_t) + low_t
-        return fre, (Dp, Hp, Wp)
+        y = torch.cat([low.unsqueeze(2), highs], dim=2)  # [B, C, 8, D', H', W']
+        y = y.view(B, C * S, Dp, Hp, Wp)                 # [B, C*8, D', H', W']
 
+        weight = self.kernels.repeat(C, 1, 1, 1, 1)      # [C*8, 1, 2, 2, 2]
 
-class PositionEmbeddingSine3D(nn.Module):
-    def __init__(self, d_model: int, num_pos_feats: int = 32, temperature: int = 10000, normalize: bool = True):
+        x = F.conv_transpose3d(
+            y, weight,
+            stride=self.stride,
+            padding=0,
+            output_padding=0,
+            groups=C
+        )
+        return x  # [B, C, 2D', 2H', 2W']
+    
+
+class WindowAttention(nn.Module):
+    def __init__(
+        self,
+        C: int,
+        window_size=(4, 4, 4),
+        shift_size=(0, 0, 0),       
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+    ):
         super().__init__()
-        self.num_pos_feats = num_pos_feats
-        self.temperature = temperature
-        self.normalize = normalize
-        self.proj = nn.Conv3d(6 * num_pos_feats, d_model, kernel_size=1, bias=False)
+        self.window_size = tuple(window_size)
+        self.shift_size = tuple(shift_size)
+
+        self.block = SwinTransformerBlock(
+            dim=C,
+            num_heads=num_heads,
+            window_size=self.window_size,
+            shift_size=self.shift_size,       
+            mlp_ratio=mlp_ratio,
+            qkv_bias=True,
+            drop=drop,
+            attn_drop=attn_drop,
+            drop_path=drop_path,
+            use_checkpoint=False,
+        )
+
+        self._mask_cache = {}  #
+
+    def _get_attn_mask(self, d: int, h: int, w: int, device: torch.device):
+        win, sh = swin_unetr.get_window_size((d, h, w), self.window_size, self.shift_size)
+
+        if not any(i > 0 for i in sh):
+            return None
+
+        dp = ((d + win[0] - 1) // win[0]) * win[0]
+        hp = ((h + win[1] - 1) // win[1]) * win[1]
+        wp = ((w + win[2] - 1) // win[2]) * win[2]
+
+        key = (dp, hp, wp, device)
+        if key not in self._mask_cache:
+            self._mask_cache[key] = swin_unetr.compute_mask([dp, hp, wp], win, sh, device)
+        return self._mask_cache[key]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, _, D, H, W = x.shape
-        device = x.device
+        # x: [B,C,D,H,W]
+        b, c, d, h, w = x.shape
+        x_cl = x.permute(0, 2, 3, 4, 1).contiguous()  # [B,D,H,W,C]
 
-        z = torch.arange(D, device=device).float()
-        y = torch.arange(H, device=device).float()
-        x_ = torch.arange(W, device=device).float()
-        zz, yy, xx = torch.meshgrid(z, y, x_, indexing="ij")
+        attn_mask = self._get_attn_mask(d, h, w, x.device)
+        x_cl = self.block(x_cl, mask_matrix=attn_mask)
 
-        if self.normalize:
-            eps = 1e-6
-            zz = zz / (D - 1 + eps) * 2 * math.pi
-            yy = yy / (H - 1 + eps) * 2 * math.pi
-            xx = xx / (W - 1 + eps) * 2 * math.pi
-
-        dim_t = torch.arange(self.num_pos_feats, device=device).float()
-        dim_t = self.temperature ** (dim_t / self.num_pos_feats)
-
-        def embed(pos):
-            pos = pos[..., None] / dim_t
-            out = torch.stack((pos.sin(), pos.cos()), dim=-1)
-            return out.flatten(-2)
-
-        ez = embed(zz)
-        ey = embed(yy)
-        ex = embed(xx)
-
-        pos = torch.cat([ez, ey, ex], dim=-1)  # (D,H,W,6F)
-        pos = pos.permute(3, 0, 1, 2).unsqueeze(0).repeat(B, 1, 1, 1, 1)
-        return self.proj(pos)
+        return x_cl.permute(0, 4, 1, 2, 3).contiguous()
 
 
-def _pad_to_multiple_3d(x: torch.Tensor, ws: Tuple[int, int, int]):
-    B, C, D, H, W = x.shape
-    wd, wh, ww = ws
-    pd = (wd - D % wd) % wd
-    ph = (wh - H % wh) % wh
-    pw = (ww - W % ww) % ww
-    if pd or ph or pw:
-        x = F.pad(x, (0, pw, 0, ph, 0, pd))
-    return x, (pd, ph, pw)
-
-
-def _crop_pad_3d(x: torch.Tensor, pads: Tuple[int, int, int]):
-    pd, ph, pw = pads
-    if pd: x = x[:, :, :-pd, :, :]
-    if ph: x = x[:, :, :, :-ph, :]
-    if pw: x = x[:, :, :, :, :-pw]
-    return x
-
-
-def _window_partition_3d(x: torch.Tensor, ws: Tuple[int, int, int]):
-    B, C, D, H, W = x.shape
-    wd, wh, ww = ws
-    assert D % wd == 0 and H % wh == 0 and W % ww == 0
-    Dg, Hg, Wg = D // wd, H // wh, W // ww
-    x = x.view(B, C, Dg, wd, Hg, wh, Wg, ww)
-    x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
-    win = x.view(B * Dg * Hg * Wg, C, wd, wh, ww)
-    return win, (Dg, Hg, Wg)
-
-
-def _window_reverse_3d(win: torch.Tensor, grid: Tuple[int, int, int], ws: Tuple[int, int, int], B: int):
-    Dg, Hg, Wg = grid
-    wd, wh, ww = ws
-    C = win.shape[1]
-    x = win.view(B, Dg, Hg, Wg, C, wd, wh, ww)
-    x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
-    return x.view(B, C, Dg * wd, Hg * wh, Wg * ww)
-
-
-def _match_dhw_by_pad_or_crop(x: torch.Tensor, target: Tuple[int, int, int]):
-    B, C, D, H, W = x.shape
-    tD, tH, tW = target
-    x = x[:, :, :min(D, tD), :min(H, tH), :min(W, tW)]
-    _, _, D2, H2, W2 = x.shape
-    pd, ph, pw = max(0, tD - D2), max(0, tH - H2), max(0, tW - W2)
-    if pd or ph or pw:
-        x = F.pad(x, (0, pw, 0, ph, 0, pd))
-    return x
-
-
-class WaveletWindowCrossAttention3D(nn.Module):
-    """
-    Windowed cross-attn:
-      Q = query_map windows
-      KV = frequency-only (wavelet+MSCM) from memory_map
-    """
-    def __init__(self, d_model: int, nhead: int,
-                 kv_stride=(2, 2, 2),
-                 window_size=(6, 12, 12),
-                 dropout: float = 0.0):
+class LowFreEnhanceBlock(nn.Module):
+    def __init__(
+        self,
+        n_blocks: int,
+        c:int,
+        window_size=(4, 4, 4),
+        num_heads=4,
+    ):
         super().__init__()
-        self.kv_stride = kv_stride
-        self.window_size = window_size
+    
+        ws = tuple(window_size)
+        ss = tuple(i // 2 for i in ws)  
 
-        self.kv_pre = WaveletMSCMFusion3D(d_model, stride=kv_stride)
-        self.pos3d = PositionEmbeddingSine3D(d_model)
+        blocks = []
+        for i in range(int(n_blocks)):
+            shift = (0, 0, 0) if (i % 2 == 0) else ss
 
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
-        self.norm = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
+            blocks.append(WindowAttention(C=c, window_size=ws, shift_size=shift, num_heads=num_heads))
+            blocks.append(nn.Sequential(
+                nn.Conv3d(c, c, kernel_size=3, padding=1, bias=False),
+                norm3d('instancenorm', c, affine=True),
+                nn.GELU(),
+            ))
+        self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, query_map: torch.Tensor, memory_map: torch.Tensor) -> torch.Tensor:
-        """
-        query_map:  (B,C,D,H,W)
-        memory_map: (B,C,D,H,W)  (skip_raw for KV frequency tokens)
-        """
-        B, C, D, H, W = query_map.shape
-        ws = self.window_size
-        sd, sh, sw = self.kv_stride
-        wd, wh, ww = ws
+    def forward(self, x):
+        x = self.proj(x)
+        res = x
+        for m in self.blocks:
+            x = m(x)
+        return x + res
 
-        # pad to window multiple
-        q_pad, pads = _pad_to_multiple_3d(query_map, ws)
-        m_pad, _ = _pad_to_multiple_3d(memory_map, ws)
-        Dp, Hp, Wp = q_pad.shape[2:]
-
-        # q pos
-        qpos = self.pos3d(torch.zeros((B, 1, Dp, Hp, Wp), device=q_pad.device, dtype=q_pad.dtype))
-
-        # freq-only KV tokens -> map
-        fre_tokens, (Dk, Hk, Wk) = self.kv_pre(m_pad)              # (B,N',C)
-        kv_map = fre_tokens.transpose(1, 2).contiguous().view(B, C, Dk, Hk, Wk)
-
-        # kv pos
-        kpos = self.pos3d(torch.zeros((B, 1, Dk, Hk, Wk), device=q_pad.device, dtype=q_pad.dtype))
-
-        # window alignment between Q and KV
-        assert wd % sd == 0 and wh % sh == 0 and ww % sw == 0, "window_size must be divisible by kv_stride"
-        k_ws = (wd // sd, wh // sh, ww // sw)
-
-        # number of query windows
-        nD, nH, nW = Dp // wd, Hp // wh, Wp // ww
-        target_k = (nD * k_ws[0], nH * k_ws[1], nW * k_ws[2])
-        kv_map = _match_dhw_by_pad_or_crop(kv_map, target_k)
-        kpos = _match_dhw_by_pad_or_crop(kpos, target_k)
-
-        # partition windows
-        q_win, q_grid = _window_partition_3d(q_pad, ws)          # (BNw,C,wd,wh,ww)
-        qp_win, _ = _window_partition_3d(qpos, ws)
-
-        k_win, k_grid = _window_partition_3d(kv_map, k_ws)       # (BNw,C,kwd,kwh,kww)
-        kp_win, _ = _window_partition_3d(kpos, k_ws)
-
-        assert q_grid == k_grid, f"Q grid {q_grid} != K grid {k_grid}"
-
-        BNw = q_win.shape[0]
-        Lq = wd * wh * ww
-        Lk = k_ws[0] * k_ws[1] * k_ws[2]
-
-        # to sequences (L, N, E) for MHA :contentReference[oaicite:6]{index=6}
-        q_seq = q_win.flatten(2).permute(2, 0, 1).contiguous()     # (Lq, BNw, C)
-        qp_seq = qp_win.flatten(2).permute(2, 0, 1).contiguous()
-
-        k_seq = k_win.flatten(2).permute(2, 0, 1).contiguous()     # (Lk, BNw, C)
-        kp_seq = kp_win.flatten(2).permute(2, 0, 1).contiguous()
-
-        attn_out = self.attn(query=q_seq + qp_seq, key=k_seq + kp_seq, value=k_seq, need_weights=False)[0]
-        out_seq = self.norm(q_seq + self.drop(attn_out))           # (Lq, BNw, C)
-
-        # back to map
-        out_win = out_seq.permute(1, 2, 0).contiguous().view(BNw, C, wd, wh, ww)
-        out_pad = _window_reverse_3d(out_win, q_grid, ws, B)       # (B,C,Dp,Hp,Wp)
-        out = _crop_pad_3d(out_pad, pads)                          # (B,C,D,H,W)
-        return out
-
-
-class WaveletWindowCrossFusion3D(nn.Module):
+    
+class FreqEnhanceBlock(nn.Module):
     """
-    Fuse:
-      y_attn = WaveletWindowCrossAttention3D(query, skip_raw)        (KV uses only frequency)
-      y_spa  = query + skip_enhanced                                (pure spatial skip fusion)
-      out    = SEFuse2Branch3D(y_attn, y_spa)
+    Input : x  [B,C,D,H,W] 
+    Output: x_rec [B,C,D,H,W]  
     """
-    def __init__(self, d_model: int, nhead: int,
-                 kv_stride=(2, 2, 2),
-                 window_size=(6, 12, 12),
-                 dropout=0.0,
-                 se_reduction: int = 16):
+    def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
-        self.cross = WaveletWindowCrossAttention3D(
-            d_model=d_model, nhead=nhead, kv_stride=kv_stride, window_size=window_size, dropout=dropout
+        self.channels = channels
+
+        self.dwt = DWT3D()
+        self.idwt = IDWT3D()
+
+        mid = max(1, channels // reduction)
+        self.gap = nn.AdaptiveAvgPool3d(1)
+        self.global_mlp = nn.Sequential(
+            nn.Conv3d(channels, mid, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid, channels, 1, bias=True),
         )
-        self.se_fuse = SEFuse2Branch3D(d_model, reduction=se_reduction, use_softmax=True)
+        self.local_mlp = nn.Sequential(
+            nn.Conv3d(channels, mid, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid, channels, 1, bias=True),
+        )
 
-    def forward(self, query_map: torch.Tensor, skip_enhanced: torch.Tensor, skip_raw: torch.Tensor) -> torch.Tensor:
-        y_attn = self.cross(query_map, skip_raw)
-        y_spa = query_map + skip_enhanced
-        return self.se_fuse(y_attn, y_spa)
+    def forward(self, x: torch.Tensor):
+        B, C, D, H, W = x.shape
+        assert C == self.channels
+        assert (D % 2 == 0) and (H % 2 == 0) and (W % 2 == 0)
+
+        low, highs = self.dwt(x)            # low: [B,C,D',H',W'], highs: [B,C,7,D',H',W']
+        high = highs.sum(dim=2)             # [B,C,D',H',W']
+        x_sum = low + high
+
+        wg = self.global_mlp(self.gap(x_sum))   # [B,C,1,1,1]
+        wl = self.local_mlp(x_sum)              # [B,C,D',H',W']
+        w = torch.sigmoid(wg + wl)              # [B,C,D',H',W']
+
+        highs_mod = highs * w.unsqueeze(2)      # [B,C,7,D',H',W']
+
+        x_rec = self.idwt(low, highs_mod)       # [B,C,D,H,W]
+
+        return x_rec
 
 
 class ConvBlock(nn.Module):
@@ -490,145 +403,3 @@ class Upsampling(nn.Module):
     def forward(self, x):
         x = self.conv(x)
         return x
-    
-
-class Encoder(nn.Module):
-    def __init__(self, n_channels=1, n_classes=14, n_filters=16, normalization='none', has_dropout=False, has_residual=False):
-        super().__init__()
-        self.has_dropout = has_dropout
-        convBlock = ConvBlock if not has_residual else ResidualConvBlock
-
-        self.block_one = convBlock(1, n_channels, n_filters, normalization=normalization)
-        self.block_one_dw = DownsamplingConvBlock(n_filters, 2 * n_filters, normalization=normalization)
-
-        self.block_two = convBlock(2, n_filters * 2, n_filters * 2, normalization=normalization)
-        self.block_two_dw = DownsamplingConvBlock(n_filters * 2, n_filters * 4, normalization=normalization)
-
-        self.block_three = convBlock(3, n_filters * 4, n_filters * 4, normalization=normalization)
-        self.block_three_dw = DownsamplingConvBlock(n_filters * 4, n_filters * 8, normalization=normalization)
-
-        self.block_four = convBlock(3, n_filters * 8, n_filters * 8, normalization=normalization)
-        self.block_four_dw = DownsamplingConvBlock(n_filters * 8, n_filters * 16, normalization=normalization)
-
-        self.block_five = convBlock(3, n_filters * 16, n_filters * 16, normalization=normalization)
-        self.dropout = nn.Dropout3d(p=0.5, inplace=False)
-
-        self.se1 = SpatialEnhance3D(n_filters * 1, kernel_size=5)
-        self.se2 = SpatialEnhance3D(n_filters * 2, kernel_size=7)
-        self.se3 = SpatialEnhance3D(n_filters * 4, kernel_size=9)
-        self.se4 = SpatialEnhance3D(n_filters * 8, kernel_size=11)
-
-    def forward(self, input):
-        x1_raw = self.block_one(input)
-        x1 = self.se1(x1_raw)
-        x1_dw = self.block_one_dw(x1)
-
-        x2_raw = self.block_two(x1_dw)
-        x2 = self.se2(x2_raw)
-        x2_dw = self.block_two_dw(x2)
-
-        x3_raw = self.block_three(x2_dw)
-        x3 = self.se3(x3_raw)
-        x3_dw = self.block_three_dw(x3)
-
-        x4_raw = self.block_four(x3_dw)
-        x4 = self.se4(x4_raw)
-        x4_dw = self.block_four_dw(x4)
-
-        x5 = self.block_five(x4_dw)
-        if self.has_dropout:
-            x5 = self.dropout(x5)
-
-        return [x1, x2, x3, x4], [x1_raw, x2_raw, x3_raw, x4_raw], x5
-
-
-class Decoder(nn.Module):
-    def __init__(self, n_classes=14, n_filters=16, normalization='none', has_dropout=False, has_residual=False):
-        super().__init__()
-        self.has_dropout = has_dropout
-
-        convBlock = ConvBlock if not has_residual else ResidualConvBlock
-
-        upsampling = UpsamplingDeconvBlock  ## using transposed convolution
-
-        self.block_five_up = upsampling(n_filters * 16, n_filters * 8, normalization=normalization)
-
-        self.block_six = convBlock(3, n_filters * 8, n_filters * 8, normalization=normalization)
-        self.block_six_up = upsampling(n_filters * 8, n_filters * 4, normalization=normalization)
-
-        self.block_seven = convBlock(3, n_filters * 4, n_filters * 4, normalization=normalization)
-        self.block_seven_up = upsampling(n_filters * 4, n_filters * 2, normalization=normalization)
-
-        self.block_eight = convBlock(2, n_filters * 2, n_filters * 2, normalization=normalization)
-        self.block_eight_up = upsampling(n_filters * 2, n_filters, normalization=normalization)
-
-        self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
-        self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
-        self.dropout = nn.Dropout3d(p=0.5, inplace=False)
-
-        self.fuse_x4 = WaveletWindowCrossFusion3D(
-            d_model=n_filters * 8, nhead=8, kv_stride=(2,2,2), window_size=(4,4,4), dropout=0.0, se_reduction=16
-        )
-        self.fuse_x3 = WaveletWindowCrossFusion3D(
-            d_model=n_filters * 4, nhead=8, kv_stride=(2,2,2), window_size=(6,6,6), dropout=0.0, se_reduction=16
-        )
-        self.fuse_x2 = WaveletWindowCrossFusion3D(
-            d_model=n_filters * 2, nhead=8, kv_stride=(2,2,2), window_size=(6,12,12), dropout=0.0, se_reduction=16
-        )
-        self.fuse_x1 = WaveletWindowCrossFusion3D(
-            d_model=n_filters * 1, nhead=4, kv_stride=(2,2,2), window_size=(6,12,12), dropout=0.0, se_reduction=16
-        )
-
-    def forward(self, features):
-        enhanced_skips, raw_skips, x5 = features
-        x1, x2, x3, x4 = enhanced_skips
-        r1, r2, r3, r4 = raw_skips
-
-        x5_up = self.block_five_up(x5)
-        x5_up = self.fuse_x4(x5_up, x4, r4)
-
-        x6 = self.block_six(x5_up)
-        x6_up = self.block_six_up(x6)
-        x6_up = self.fuse_x3(x6_up, x3, r3)
-
-        x7 = self.block_seven(x6_up)
-        x7_up = self.block_seven_up(x7)
-        x7_up = self.fuse_x2(x7_up, x2, r2)
-
-        x8 = self.block_eight(x7_up)
-        x8_up = self.block_eight_up(x8)
-        x8_up = self.fuse_x1(x8_up, x1, r1)
-
-        x9 = self.block_nine(x8_up)
-        if self.has_dropout:
-            x9 = self.dropout(x9)
-        out_seg = self.out_conv(x9)
-        return out_seg
-
-
-class VNet(nn.Module):
-    def __init__(self, n_channels=1, n_classes=14, patch_size=96, n_filters=16,
-                 normalization='instancenorm', has_dropout=False, has_residual=False):
-        super(VNet, self).__init__()
-        self.num_classes = n_classes
-        self.encoder = Encoder(
-            n_channels=n_channels,
-            n_classes=n_classes,
-            n_filters=n_filters,
-            normalization=normalization,
-            has_dropout=has_dropout,
-            has_residual=has_residual
-        )
-        self.decoder = Decoder(
-            n_classes=n_classes,
-            n_filters=n_filters,
-            normalization=normalization,
-            has_dropout=has_dropout,
-            has_residual=has_residual
-        )
-
-    def forward(self, input):
-        features = self.encoder(input)
-        out_seg = self.decoder(features)
-        return out_seg
-
