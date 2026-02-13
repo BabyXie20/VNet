@@ -320,17 +320,11 @@ class FreqEnhanceBlock(nn.Module):
         self.dwt = DWT_3D('haar')
         self.idwt = IDWT_3D('haar')
         self.lowtransform= LowFreEnhanceBlock(n_blocks, channels, window_size,num_heads)
-        mid = max(1, channels // reduction)
-        self.gap = nn.AdaptiveAvgPool3d(1)
-        self.global_mlp = nn.Sequential(
-            nn.Conv3d(channels, mid, 1, bias=True),
+        self.subband_att = nn.Sequential(
+            nn.Conv3d(channels * 7, max(1, channels // reduction), kernel_size=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv3d(mid, channels, 1, bias=True),
-        )
-        self.local_mlp = nn.Sequential(
-            nn.Conv3d(channels, mid, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(mid, channels, 1, bias=True),
+            nn.Conv3d(max(1, channels // reduction), 7, kernel_size=1, bias=True),
+            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor):
@@ -339,30 +333,36 @@ class FreqEnhanceBlock(nn.Module):
         assert (D % 2 == 0) and (H % 2 == 0) and (W % 2 == 0)
 
         low, llh, lhl, lhh, hll, hlh, hhl, hhh = self.dwt(x)
-        highs = torch.stack([llh, lhl, lhh, hll, hlh, hhl, hhh], dim=2)
-        high = highs.sum(dim=2)
+        highs = torch.cat([
+            llh.unsqueeze(2), lhl.unsqueeze(2), lhh.unsqueeze(2),
+            hll.unsqueeze(2), hlh.unsqueeze(2), hhl.unsqueeze(2), hhh.unsqueeze(2)
+        ], dim=2)
+
+        high_cat = highs.view(B, C * 7, *highs.shape[-3:])
+        highs_att = highs * self.subband_att(high_cat).unsqueeze(1)
+        high_agg = highs_att.sum(dim=2)
 
         low=self.lowtransform(low)
-        x_sum = low + high
+        x_sum = low + high_agg
 
-        wg = self.global_mlp(self.gap(x_sum))   # [B,C,1,1,1]
-        wl = self.local_mlp(x_sum)              # [B,C,D',H',W']
-        w = torch.sigmoid(wg + wl)              # [B,C,D',H',W']
-
-        highs_mod = highs * w.unsqueeze(2)      # [B,C,7,D',H',W']
-
-        x_rec = self.idwt(
+        zeros = torch.zeros_like(low)
+        low_rec = self.idwt(
             low,
-            highs_mod[:, :, 0, ...],
-            highs_mod[:, :, 1, ...],
-            highs_mod[:, :, 2, ...],
-            highs_mod[:, :, 3, ...],
-            highs_mod[:, :, 4, ...],
-            highs_mod[:, :, 5, ...],
-            highs_mod[:, :, 6, ...],
+            zeros, zeros, zeros,
+            zeros, zeros, zeros, zeros,
+        )
+        high_rec = self.idwt(
+            zeros,
+            highs_att[:, :, 0, ...],
+            highs_att[:, :, 1, ...],
+            highs_att[:, :, 2, ...],
+            highs_att[:, :, 3, ...],
+            highs_att[:, :, 4, ...],
+            highs_att[:, :, 5, ...],
+            highs_att[:, :, 6, ...],
         )
 
-        return x_rec
+        return low_rec, high_rec
 
 
 class ConvBlock(nn.Module):
