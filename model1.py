@@ -1,12 +1,15 @@
 from __future__ import annotations
-import math
 from typing import Literal, Optional
 from typing import Sequence, Tuple
 import torch
 from torch import nn
-import torch.nn.functional as F
 from monai.networks.nets.swin_unetr import SwinTransformerBlock
 from monai.networks.nets import swin_unetr
+
+if __package__:
+    from .DWT_IDWT_layer import DWT_3D, IDWT_3D
+else:
+    from DWT_IDWT_layer import DWT_3D, IDWT_3D
 
 
 NormType = Optional[Literal["batchnorm", "groupnorm", "instancenorm", "none"]]
@@ -30,103 +33,6 @@ def norm3d(norm: NormType, num_channels: int, affine: bool = True) -> nn.Module:
     if norm in ("none", None):
         return nn.Identity()
     raise ValueError(f"Unknown normalization: {norm}")
-
-
-def _haar_pair():
-    s2 = math.sqrt(2.0)
-    L = torch.tensor([1., 1.]) / s2
-    H = torch.tensor([1., -1.]) / s2
-    return L, H
-
-
-def _kron3(a, b, c):
-    return torch.einsum('i,j,k->ijk', a, b, c)
-
-
-def _build_haar_3d_kernels(device):
-    L, H = _haar_pair()
-    taps = []
-    for zf in [L, H]:
-        for yf in [L, H]:
-            for xf in [L, H]:
-                taps.append(_kron3(zf, yf, xf))  # [2, 2, 2]
-    k = torch.stack(taps, dim=0)[:, None, ...]  # [8, 1, 2, 2, 2]
-    stride = (2, 2, 2)
-    ksize = (2, 2, 2)
-    return k.to(device), stride, ksize
-
-
-class DWT3D(nn.Module):
-    """
-    3D 离散小波变换 (Discrete Wavelet Transform) - Haar
-    输入:  x: [B, C, D, H, W]
-    输出:  low:   [B, C, D/2, H/2, W/2]
-           highs: [B, C, 7,   D/2, H/2, W/2]
-    """
-    def __init__(self):
-        super().__init__()
-        k, stride, ksize = _build_haar_3d_kernels(device=torch.device('cpu'))
-        # k: [8, 1, 2, 2, 2]
-        self.register_buffer("kernels", k)  
-        self.stride = stride                 
-        self.ksize = ksize                   
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: [B, C, D, H, W]
-        """
-        B, C, D, H, W = x.shape
-        S = self.kernels.shape[0]           # 8
-        # [C*8, 1, 2,2,2]
-        weight = self.kernels.repeat(C, 1, 1, 1, 1)
-
-        # groups=C 的分组卷积
-        y = F.conv3d(x, weight, stride=self.stride, padding=0, groups=C)
-        # y: [B, C*8, D/2, H/2, W/2]
-
-        y = y.view(B, C, S, *y.shape[-3:])  # [B, C, 8, D/2, H/2, W/2]
-        low = y[:, :, :1, ...].squeeze(2)   # [B, C, D/2, H/2, W/2]
-        highs = y[:, :, 1:, ...]            # [B, C, 7, D/2, H/2, W/2]
-        return low, highs
-
-
-class IDWT3D(nn.Module):
-    """
-    3D 逆离散小波变换 (Inverse DWT) - Haar
-    输入:
-        low:   [B, C, D', H', W']
-        highs: [B, C, 7, D', H', W']
-    输出:
-        x: [B, C, 2D', 2H', 2W']
-    """
-    def __init__(self):
-        super().__init__()
-        k, stride, ksize = _build_haar_3d_kernels(device=torch.device('cpu'))
-        self.register_buffer("kernels", k)   # [8, 1, 2, 2, 2]
-        self.stride = stride
-        self.ksize = ksize
-
-    def forward(self, low: torch.Tensor, highs: torch.Tensor):
-        """
-        low:   [B, C, D', H', W']
-        highs: [B, C, 7, D', H', W']
-        """
-        B, C, Dp, Hp, Wp = low.shape
-        S = self.kernels.shape[0]           # 8
-
-        y = torch.cat([low.unsqueeze(2), highs], dim=2)  # [B, C, 8, D', H', W']
-        y = y.view(B, C * S, Dp, Hp, Wp)                 # [B, C*8, D', H', W']
-
-        weight = self.kernels.repeat(C, 1, 1, 1, 1)      # [C*8, 1, 2, 2, 2]
-
-        x = F.conv_transpose3d(
-            y, weight,
-            stride=self.stride,
-            padding=0,
-            output_padding=0,
-            groups=C
-        )
-        return x  # [B, C, 2D', 2H', 2W']
 
 
 class WindowAttention(nn.Module):
@@ -411,20 +317,14 @@ class FreqEnhanceBlock(nn.Module):
         super().__init__()
         self.channels = channels
 
-        self.dwt = DWT3D()
-        self.idwt = IDWT3D()
+        self.dwt = DWT_3D('haar')
+        self.idwt = IDWT_3D('haar')
         self.lowtransform= LowFreEnhanceBlock(n_blocks, channels, window_size,num_heads)
-        mid = max(1, channels // reduction)
-        self.gap = nn.AdaptiveAvgPool3d(1)
-        self.global_mlp = nn.Sequential(
-            nn.Conv3d(channels, mid, 1, bias=True),
+        self.subband_att = nn.Sequential(
+            nn.Conv3d(channels * 7, max(1, channels // reduction), kernel_size=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv3d(mid, channels, 1, bias=True),
-        )
-        self.local_mlp = nn.Sequential(
-            nn.Conv3d(channels, mid, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(mid, channels, 1, bias=True),
+            nn.Conv3d(max(1, channels // reduction), 7, kernel_size=1, bias=True),
+            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor):
@@ -432,21 +332,37 @@ class FreqEnhanceBlock(nn.Module):
         assert C == self.channels
         assert (D % 2 == 0) and (H % 2 == 0) and (W % 2 == 0)
 
-        low, highs = self.dwt(x)            # low: [B,C,D',H',W'], highs: [B,C,7,D',H',W']
-        high = highs.sum(dim=2)             # [B,C,D',H',W']
+        low, llh, lhl, lhh, hll, hlh, hhl, hhh = self.dwt(x)
+        highs = torch.cat([
+            llh.unsqueeze(2), lhl.unsqueeze(2), lhh.unsqueeze(2),
+            hll.unsqueeze(2), hlh.unsqueeze(2), hhl.unsqueeze(2), hhh.unsqueeze(2)
+        ], dim=2)
+
+        high_cat = highs.view(B, C * 7, *highs.shape[-3:])
+        highs_att = highs * self.subband_att(high_cat).unsqueeze(1)
+        high_agg = highs_att.sum(dim=2)
 
         low=self.lowtransform(low)
-        x_sum = low + high
+        x_sum = low + high_agg
 
-        wg = self.global_mlp(self.gap(x_sum))   # [B,C,1,1,1]
-        wl = self.local_mlp(x_sum)              # [B,C,D',H',W']
-        w = torch.sigmoid(wg + wl)              # [B,C,D',H',W']
+        zeros = torch.zeros_like(low)
+        low_rec = self.idwt(
+            low,
+            zeros, zeros, zeros,
+            zeros, zeros, zeros, zeros,
+        )
+        high_rec = self.idwt(
+            zeros,
+            highs_att[:, :, 0, ...],
+            highs_att[:, :, 1, ...],
+            highs_att[:, :, 2, ...],
+            highs_att[:, :, 3, ...],
+            highs_att[:, :, 4, ...],
+            highs_att[:, :, 5, ...],
+            highs_att[:, :, 6, ...],
+        )
 
-        highs_mod = highs * w.unsqueeze(2)      # [B,C,7,D',H',W']
-
-        x_rec = self.idwt(low, highs_mod)       # [B,C,D,H,W]
-
-        return x_rec
+        return low_rec, high_rec
 
 
 class ConvBlock(nn.Module):
