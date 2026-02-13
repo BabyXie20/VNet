@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
-from typing import Literal, Optional, Tuple
-import numpy as np
+from typing import Literal, Optional
+from typing import Sequence, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -127,7 +127,7 @@ class IDWT3D(nn.Module):
             groups=C
         )
         return x  # [B, C, 2D', 2H', 2W']
-    
+
 
 class WindowAttention(nn.Module):
     def __init__(
@@ -136,7 +136,7 @@ class WindowAttention(nn.Module):
         window_size=(4, 4, 4),
         shift_size=(0, 0, 0),       
         num_heads: int = 4,
-        mlp_ratio: float = 2.0,
+        mlp_ratio: float = 4.0,
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
@@ -186,51 +186,234 @@ class WindowAttention(nn.Module):
         return x_cl.permute(0, 4, 1, 2, 3).contiguous()
 
 
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or (not self.training):
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        # broadcast along non-batch dims
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        rnd = x.new_empty(shape).bernoulli_(keep_prob)
+        return x * rnd / keep_prob
+
+
+class LayerScale3D(nn.Module):
+    def __init__(self, channels: int, init_value: float = 1e-4):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1, 1) * init_value)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+
+class AnisoInceptionConv3D(nn.Module):
+    def __init__(self, c: int, dilation: int = 1):
+        super().__init__()
+        d = dilation
+        self.b1 = nn.Conv3d(
+            c, c, kernel_size=(1, 5, 5),
+            padding=(0, 2*d, 2*d),
+            dilation=(1, d, d), bias=False
+        )
+        self.b2 = nn.Conv3d(
+            c, c,
+            kernel_size=(3, 1, 1),
+            padding=(dilation, 0, 0),
+            dilation=(dilation, 1, 1),
+            groups=c,   
+            bias=False
+        )
+        self.b3 = nn.Conv3d(
+            c, c, kernel_size=(1, 1, 5),
+            padding=(0, 0, 2*d),
+            dilation=(1, 1, d), bias=False
+        )
+        self.b4 = nn.Conv3d(
+            c, c, kernel_size=(1, 5, 1),
+            padding=(0, 2*d, 0),
+            dilation=(1, d, 1), bias=False
+        )
+
+        self.fuse = nn.Conv3d(4 * c, c, kernel_size=1, bias=False)
+        self.norm = norm3d('instancenorm', c, affine=True)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.cat([self.b1(x), self.b2(x), self.b3(x), self.b4(x)], dim=1)
+        y = self.fuse(y)
+        y = self.act(self.norm(y))
+        return y
+
+
+class MultiShapeWindowAttention(nn.Module):
+    def __init__(
+        self,
+        c: int,
+        window_sizes: Sequence[Tuple[int, int, int]],
+        shift: bool,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        gate_reduction: int = 8,
+    ):
+        super().__init__()
+        self.window_sizes = [tuple(ws) for ws in window_sizes]
+        self.shift = bool(shift)
+        self.num_branches = len(self.window_sizes)
+
+        branches = []
+        for ws in self.window_sizes:
+            if self.shift:
+                ss = tuple(max(0, w // 2) for w in ws)
+            else:
+                ss = (0, 0, 0)
+            branches.append(
+                WindowAttention(
+                    C=c,
+                    window_size=ws,
+                    shift_size=ss,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    drop=drop,
+                    attn_drop=attn_drop,
+                    drop_path=drop_path,
+                )
+            )
+        self.branches = nn.ModuleList(branches)
+
+        # gating: x -> [B,K,1,1,1] then softmax over K
+        hidden = max(1, c // gate_reduction)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(c, hidden, 1, bias=True),
+            nn.GELU(),
+            nn.Conv3d(hidden, self.num_branches, 1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,C,D,H,W]
+        outs = [b(x) for b in self.branches]  # list of [B,C,D,H,W]
+        w = self.gate(x).softmax(dim=1)       # [B,K,1,1,1]
+        y = 0
+        for k, o in enumerate(outs):
+            y = y + o * w[:, k:k+1]
+        return y
+
+
 class LowFreEnhanceBlock(nn.Module):
     def __init__(
         self,
         n_blocks: int,
-        c:int,
-        window_size=(4, 4, 4),
-        num_heads=4,
+        c: int,
+        window_size: Tuple[int, int, int] = (4, 4, 4),
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        layer_scale_init: float = 1e-4,
+        conv_dilation: int = 1,
+        window_shapes: Optional[Sequence[Tuple[int, int, int]]] = None,
     ):
         super().__init__()
-    
-        ws = tuple(window_size)
-        ss = tuple(i // 2 for i in ws)  
+        self.n_blocks = int(n_blocks)
+        self.c = int(c)
 
-        blocks = []
-        for i in range(int(n_blocks)):
-            shift = (0, 0, 0) if (i % 2 == 0) else ss
+        base_ws = tuple(window_size)
 
-            blocks.append(WindowAttention(C=c, window_size=ws, shift_size=shift, num_heads=num_heads))
-            blocks.append(nn.Sequential(
-                nn.Conv3d(c, c, kernel_size=3, padding=1, bias=False),
-                norm3d('instancenorm', c, affine=True),
-                nn.GELU(),
-            ))
-        self.blocks = nn.ModuleList(blocks)
+        def _clamp_ws(ws: Tuple[int, int, int], cap: int = 12) -> Tuple[int, int, int]:
+            # avoid too large windows (esp. for low-res subband)
+            return tuple(max(1, min(int(v), cap)) for v in ws)
 
-    def forward(self, x):
-        x = self.proj(x)
-        res = x
-        for m in self.blocks:
-            x = m(x)
-        return x + res
+        # default multi-shape set: iso + strip variants
+        if window_shapes is None:
+            # iso
+            iso = base_ws
+            # strip-ish variants (favor long-range on two axes, compact on one axis)
+            strip1 = (max(1, base_ws[0] // 2), base_ws[1] * 2, base_ws[2] * 2)
+            strip2 = (base_ws[0] * 2, max(1, base_ws[1] // 2), base_ws[2] * 2)
+            strip3 = (base_ws[0] * 2, base_ws[1] * 2, max(1, base_ws[2] // 2))
+            window_shapes = [_clamp_ws(iso), _clamp_ws(strip1), _clamp_ws(strip2), _clamp_ws(strip3)]
+        else:
+            window_shapes = [tuple(ws) for ws in window_shapes]
 
-    
+        self.window_shapes = window_shapes
+
+        # distribute droppath across layers (optional but usually better)
+        if self.n_blocks > 1:
+            dp_rates = torch.linspace(0, drop_path, steps=self.n_blocks).tolist()
+        else:
+            dp_rates = [drop_path]
+
+        self.attn_layers = nn.ModuleList()
+        self.conv_layers = nn.ModuleList()
+        self.attn_ls = nn.ModuleList()
+        self.conv_ls = nn.ModuleList()
+        self.attn_dp = nn.ModuleList()
+        self.conv_dp = nn.ModuleList()
+
+        for i in range(self.n_blocks):
+            use_shift = (i % 2 == 1)
+
+            self.attn_layers.append(
+                MultiShapeWindowAttention(
+                    c=c,
+                    window_sizes=self.window_shapes,
+                    shift=use_shift,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    drop=drop,
+                    attn_drop=attn_drop,
+                    drop_path=0.0,  # keep Swin internal droppath off; we handle outer droppath for stability
+                )
+            )
+            self.conv_layers.append(AnisoInceptionConv3D(c=c, dilation=conv_dilation))
+
+            # LayerScale + DropPath per sublayer
+            self.attn_ls.append(LayerScale3D(c, init_value=layer_scale_init))
+            self.conv_ls.append(LayerScale3D(c, init_value=layer_scale_init))
+            self.attn_dp.append(DropPath(dp_rates[i]))
+            self.conv_dp.append(DropPath(dp_rates[i]))
+
+        # optional final residual scale (kept simple)
+        self.final_ls = LayerScale3D(c, init_value=1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B,C,D',H',W'] (low subband)
+        """
+        res0 = x
+
+        for attn, conv, ls_a, ls_c, dp_a, dp_c in zip(
+            self.attn_layers, self.conv_layers, self.attn_ls, self.conv_ls, self.attn_dp, self.conv_dp
+        ):
+            # --- attention sublayer (delta residual for stability) ---
+            y = attn(x)
+            x = x + dp_a(ls_a(y - x))
+
+            # --- conv sublayer (residual) ---
+            y = conv(x)
+            x = x + dp_c(ls_c(y))
+
+        # global skip (keeps low-frequency identity path)
+        x = self.final_ls(x) + res0
+        return x
+
+
 class FreqEnhanceBlock(nn.Module):
-    """
-    Input : x  [B,C,D,H,W] 
-    Output: x_rec [B,C,D,H,W]  
-    """
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, channels: int,n_blocks: int,window_size=(4,4,4),num_heads=4,reduction: int = 16):
         super().__init__()
         self.channels = channels
 
         self.dwt = DWT3D()
         self.idwt = IDWT3D()
-
+        self.lowtransform= LowFreEnhanceBlock(n_blocks, channels, window_size,num_heads)
         mid = max(1, channels // reduction)
         self.gap = nn.AdaptiveAvgPool3d(1)
         self.global_mlp = nn.Sequential(
@@ -251,6 +434,8 @@ class FreqEnhanceBlock(nn.Module):
 
         low, highs = self.dwt(x)            # low: [B,C,D',H',W'], highs: [B,C,7,D',H',W']
         high = highs.sum(dim=2)             # [B,C,D',H',W']
+
+        low=self.lowtransform(low)
         x_sum = low + high
 
         wg = self.global_mlp(self.gap(x_sum))   # [B,C,1,1,1]
@@ -363,21 +548,204 @@ class UpsamplingDeconvBlock(nn.Module):
         return x
 
 
-class Upsampling(nn.Module):
-    def __init__(self, n_filters_in, n_filters_out, stride=2, normalization='none'):
-        super(Upsampling, self).__init__()
+class FreqGuidedChannelFusion3D(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        reduction: int = 16,
+        pool: str = "avgmax",
+        dropout: float = 0.0,
+        out_mode: str = "residual_mul",  # ['residual_mul', 'residual_add', 'mul']
+    ):
+        super().__init__()
 
-        ops = []
-        ops.append(nn.Upsample(scale_factor=stride, mode='trilinear', align_corners=False))
-        ops.append(nn.Conv3d(n_filters_in, n_filters_out, kernel_size=3, padding=1))
-        if normalization not in ('batchnorm', 'groupnorm', 'instancenorm', 'none'):
-            raise ValueError(f"Unknown normalization: {normalization}")
-        if normalization != 'none':
-            ops.append(norm3d(normalization, n_filters_out))
-        ops.append(nn.ReLU(inplace=True))
+        self.channels = channels
+        self.pool = pool
+        self.out_mode = out_mode
 
-        self.conv = nn.Sequential(*ops)
+        hidden = max(channels // reduction, 1)
+        # shared MLP (SE/CBAM style)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False),
+        )
+        self.act = nn.Sigmoid()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x):
-        x = self.conv(x)
-        return x
+    @staticmethod
+    def _gap(x: torch.Tensor) -> torch.Tensor:
+        # (B,C,D,H,W) -> (B,C)
+        return x.mean(dim=(2, 3, 4))
+
+    @staticmethod
+    def _gmp(x: torch.Tensor) -> torch.Tensor:
+        # (B,C,D,H,W) -> (B,C)
+        return x.amax(dim=(2, 3, 4))
+
+    def forward(self, fs: torch.Tensor, ff: torch.Tensor) -> torch.Tensor:
+        b, c, d, h, w = fs.shape
+
+        if self.pool == "avg":
+            desc = self._gap(ff)
+            attn = self.mlp(desc)
+        elif self.pool == "max":
+            desc = self._gmp(ff)
+            attn = self.mlp(desc)
+        else:  # 'avgmax' (CBAM style)
+            attn = self.mlp(self._gap(ff)) + self.mlp(self._gmp(ff))
+
+        w_ch = self.act(attn).view(b, c, 1, 1, 1)
+        w_ch = self.drop(w_ch)
+
+        # fuse
+        if self.out_mode == "mul":
+            return fs * w_ch
+        elif self.out_mode == "residual_add":
+            # fs + fs*w  (explicit form)
+            return fs + fs * w_ch
+        else:  # 'residual_mul'
+            return fs * (1.0 + w_ch)
+
+
+class WaveletDown(nn.Module):
+    def __init__(self,c_in,c_out,n_stages,n_blocks,window_size,reduction,num_heads,normalization: NormType = "instancenorm"):
+        super().__init__()
+
+        self.reduction=reduction
+        self.n_blocks=n_blocks
+        self.window_size=window_size
+        self.num_heads=num_heads
+        self.conv = ConvBlock(
+            n_stages=n_stages,
+            n_filters_in=c_in,
+            n_filters_out=c_in,
+            normalization=normalization
+        )
+        self.fre=FreqEnhanceBlock(
+            channels=c_in,n_blocks=n_blocks,window_size=window_size,num_heads=num_heads,reduction=reduction
+        )
+
+        self.fuse = FreqGuidedChannelFusion3D(channels=c_in, reduction=reduction)
+
+        
+        self.down = DownsamplingConvBlock(c_in, c_out, stride=2, normalization=normalization)
+
+    def forward(self, x_spatial: torch.Tensor):
+      
+        x_spatial = self.conv(x_spatial) 
+        x_fre=self.fre(x_spatial)
+        x_fuse=self.fuse(x_spatial,x_fre)
+        skip_enc=x_fuse
+        x_next= self.down(x_fuse)               
+        
+        return x_next, skip_enc
+    
+
+class Encoder(nn.Module):
+    def __init__(self, n_channels=1, n_classes=14, n_filters=16, normalization='none', has_dropout=False,
+                 has_residual=False):
+        super(Encoder, self).__init__()
+        self.has_dropout = has_dropout
+        convBlock = ConvBlock if not has_residual else ResidualConvBlock
+        self.stem = convBlock(1, n_channels, n_filters, normalization=normalization)
+
+        self.down1 = WaveletDown(n_filters,      n_filters * 2,  n_stages=1,num_heads=1,window_size=(3,4,4),reduction=4,n_blocks=1,normalization=normalization)
+        self.down2 = WaveletDown(n_filters * 2,  n_filters * 4,  n_stages=2,num_heads=2,window_size=(6,6,6),reduction=8,n_blocks=1,normalization=normalization)
+        self.down3 = WaveletDown(n_filters * 4,  n_filters * 8,  n_stages=3,num_heads=4,window_size=(6,6,6),reduction=8,n_blocks=2,normalization=normalization)
+        self.down4 = WaveletDown(n_filters * 8,  n_filters * 16, n_stages=3,num_heads=8,window_size=(3,3,3),reduction=16,n_blocks=2,normalization=normalization)
+
+        self.bottleneck = convBlock(3, n_filters * 16, n_filters * 16, normalization=normalization)
+        self.dropout = nn.Dropout3d(p=0.5, inplace=False)
+
+    def forward(self, input):
+        x = self.stem(input)
+
+        x1,s1 = self.down1(x)
+        x2,s2 = self.down2(x1)
+        x3,s3 = self.down3(x2)
+        x4,s4 = self.down4(x3)
+
+        z = self.bottleneck(x4)
+
+        return {
+            'skips': [s1, s2, s3, s4],
+            'bottleneck': z,
+        }
+    
+
+class Decoder(nn.Module):
+    def __init__(self,n_classes=14, n_filters=16, normalization='none', has_dropout=False,
+                 has_residual=False):
+        super(Decoder, self).__init__()
+        self.has_dropout = has_dropout
+
+        convBlock = ConvBlock if not has_residual else ResidualConvBlock
+
+        self.block_five_up = UpsamplingDeconvBlock(n_filters * 16, n_filters * 8, normalization=normalization)
+
+        self.block_six = convBlock(3, n_filters * 8, n_filters * 8, normalization=normalization)
+        self.block_six_up = UpsamplingDeconvBlock(n_filters * 8, n_filters * 4, normalization=normalization)
+
+        self.block_seven = convBlock(3, n_filters * 4, n_filters * 4, normalization=normalization)
+        self.block_seven_up = UpsamplingDeconvBlock(n_filters * 4, n_filters * 2, normalization=normalization)
+
+        self.block_eight = convBlock(2, n_filters * 2, n_filters * 2, normalization=normalization)
+        self.block_eight_up = UpsamplingDeconvBlock(n_filters * 2, n_filters, normalization=normalization)
+
+        self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
+        self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
+        self.dropout = nn.Dropout3d(p=0.5, inplace=False)
+
+    def forward(self, features):
+        s1, s2, s3, s4 = features['skips']
+        z = features['bottleneck']
+
+        x5_up = self.block_five_up(z)
+        x5_up = x5_up + s4
+
+        x6 = self.block_six(x5_up)
+        x6_up = self.block_six_up(x6)
+        x6_up = x6_up + s3
+
+        x7 = self.block_seven(x6_up)
+        x7_up = self.block_seven_up(x7)
+        x7_up = x7_up + s2
+
+        x8 = self.block_eight(x7_up)
+        x8_up = self.block_eight_up(x8)
+        x8_up = x8_up + s1
+        x9 = self.block_nine(x8_up)
+        
+        if self.has_dropout:
+            x9 = self.dropout(x9)
+        out_seg = self.out_conv(x9)
+        return out_seg
+
+
+class VNet(nn.Module):
+    def __init__(self, n_channels=1, n_classes=14, patch_size=96, n_filters=16,
+                 normalization='instancenorm', has_dropout=False, has_residual=False,
+                 input_layout: str = "NCHWD"):   
+        super(VNet, self).__init__()
+        self.num_classes = n_classes
+        self.input_layout = input_layout
+        self.encoder = Encoder(n_channels, n_classes, n_filters, normalization, has_dropout, has_residual)
+        self.decoder = Decoder(n_classes, n_filters, normalization, has_dropout, has_residual)
+
+    def _to_ncdhw(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_layout.upper() == "NCHWD":
+            return x.permute(0, 1, 4, 2, 3).contiguous()  
+        return x 
+
+    def _to_nchwd(self, y: torch.Tensor) -> torch.Tensor:
+        if self.input_layout.upper() == "NCHWD":
+            return y.permute(0, 1, 3, 4, 2).contiguous()  
+        return y
+
+    def forward(self, input: torch.Tensor):
+        x = self._to_ncdhw(input)  
+        features = self.encoder(x)
+        out_seg  = self.decoder(features) 
+        out_seg  = self._to_nchwd(out_seg) 
+        return out_seg
