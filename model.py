@@ -231,12 +231,21 @@ class DWC1x1x1(nn.Module):
 
 
 class CrossAttention3D(nn.Module):
-    def __init__(self, channels, num_heads=8, attn_dropout=0.0, proj_dropout=0.0):
+    """
+    Window-based cross-attention for 3D feature maps.
+
+    The window partition/reverse path follows the same idea used in MONAI Swin
+    blocks: partition local 3D windows, run attention inside each window, then
+    restore the full volume.
+    """
+
+    def __init__(self, channels, num_heads=8, window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         assert channels % num_heads == 0
         self.c = channels
         self.h = num_heads
         self.dh = channels // num_heads
+        self.window_size = tuple(window_size)
 
         self.norm_q = nn.LayerNorm(channels)
         self.norm_kv = nn.LayerNorm(channels)
@@ -245,21 +254,39 @@ class CrossAttention3D(nn.Module):
         self.proj_drop = nn.Dropout(proj_dropout)
         self.attn_drop = attn_dropout
 
-    def _to_tokens(self, x):
-        # (B,C,D,H,W) -> (B,N,C)
-        B, C, D, H, W = x.shape
-        t = x.flatten(2).transpose(1, 2)  # (B, N, C)
-        return t, (D, H, W)
+    def _window_partition(self, x: torch.Tensor):
+        # x: [B, D, H, W, C]
+        B, D, H, W, C = x.shape
+        wd, wh, ww = self.window_size
 
-    def _to_map(self, t, shape):
-        D, H, W = shape
-        # (B,N,C) -> (B,C,D,H,W)
-        return t.transpose(1, 2).reshape(t.size(0), self.c, D, H, W)
+        pd = (wd - D % wd) % wd
+        ph = (wh - H % wh) % wh
+        pw = (ww - W % ww) % ww
+        if pd > 0 or ph > 0 or pw > 0:
+            x = F.pad(x, (0, 0, 0, pw, 0, ph, 0, pd))
+
+        Dp, Hp, Wp = D + pd, H + ph, W + pw
+        x = x.view(B, Dp // wd, wd, Hp // wh, wh, Wp // ww, ww, C)
+        windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, wd * wh * ww, C)
+        return windows, (D, H, W, Dp, Hp, Wp)
+
+    def _window_reverse(self, windows: torch.Tensor, shape_meta):
+        D, H, W, Dp, Hp, Wp = shape_meta
+        wd, wh, ww = self.window_size
+        B = windows.shape[0] // ((Dp // wd) * (Hp // wh) * (Wp // ww))
+
+        x = windows.view(B, Dp // wd, Hp // wh, Wp // ww, wd, wh, ww, self.c)
+        x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, Dp, Hp, Wp, self.c)
+        return x[:, :D, :H, :W, :]
 
     def forward(self, q_map, k_map, v_map):
-        q, shp = self._to_tokens(q_map)
-        k, _   = self._to_tokens(k_map)
-        v, _   = self._to_tokens(v_map)
+        q_map = q_map.permute(0, 2, 3, 4, 1).contiguous()  # [B,D,H,W,C]
+        k_map = k_map.permute(0, 2, 3, 4, 1).contiguous()
+        v_map = v_map.permute(0, 2, 3, 4, 1).contiguous()
+
+        q, shp = self._window_partition(q_map)
+        k, _ = self._window_partition(k_map)
+        v, _ = self._window_partition(v_map)
 
         q = self.norm_q(q)
         k = self.norm_kv(k)
@@ -268,8 +295,8 @@ class CrossAttention3D(nn.Module):
         B, Nq, C = q.shape
         Nk = k.shape[1]
 
-        q = q.view(B, Nq, self.h, self.dh).transpose(1, 2)  # (B,h,Nq,dh)
-        k = k.view(B, Nk, self.h, self.dh).transpose(1, 2)  # (B,h,Nk,dh)
+        q = q.view(B, Nq, self.h, self.dh).transpose(1, 2)  # (BnW,h,Nq,dh)
+        k = k.view(B, Nk, self.h, self.dh).transpose(1, 2)  # (BnW,h,Nk,dh)
         v = v.view(B, Nk, self.h, self.dh).transpose(1, 2)
 
         out = F.scaled_dot_product_attention(
@@ -278,13 +305,40 @@ class CrossAttention3D(nn.Module):
             is_causal=False
         )  
 
-        out = out.transpose(1, 2).contiguous().view(B, Nq, C)  # (B,Nq,C)
+        out = out.transpose(1, 2).contiguous().view(B, Nq, C)  # (BnW,Nq,C)
         out = self.proj_drop(self.proj(out))
-        return self._to_map(out, shp)
+        out = self._window_reverse(out, shp)
+        return out.permute(0, 4, 1, 2, 3).contiguous()
+
+
+def recommended_window_attn_config(patch_size: int | Sequence[int] = (96, 96, 96)):
+    """Recommended window-attention setup for 3D medical segmentation.
+
+    For patch size (96, 96, 96), skip features after DWT are typically 48^3 and
+    24^3, both divisible by (6, 6, 6), which keeps local context and memory in
+    good balance.
+    """
+    if isinstance(patch_size, int):
+        patch_size = (patch_size, patch_size, patch_size)
+
+    if tuple(patch_size) == (96, 96, 96):
+        return {
+            "skip1": {"num_heads": 4, "window_size": (6, 6, 6)},
+            "skip2": {"num_heads": 4, "window_size": (6, 6, 6)},
+            "attn_dropout": 0.0,
+            "proj_dropout": 0.1,
+        }
+
+    return {
+        "skip1": {"num_heads": 2, "window_size": (4, 4, 4)},
+        "skip2": {"num_heads": 4, "window_size": (4, 4, 4)},
+        "attn_dropout": 0.0,
+        "proj_dropout": 0.1,
+    }
 
 
 class GatedFreqCrossAttn3D(nn.Module):
-    def __init__(self, channels: int, num_heads: int = 8, num_high: int = 7):
+    def __init__(self, channels: int, num_heads: int = 8, num_high: int = 7, window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
         super().__init__()
         self.num_high = num_high
 
@@ -298,8 +352,11 @@ class GatedFreqCrossAttn3D(nn.Module):
 
         self.fuse_hi = nn.Conv3d(num_high * channels, channels, kernel_size=1, bias=False)
 
-        self.attn_low = CrossAttention3D(channels, num_heads=num_heads)
-        self.attn_high = nn.ModuleList([CrossAttention3D(channels, num_heads=num_heads) for _ in range(num_high)])
+        self.attn_low = CrossAttention3D(channels, num_heads=num_heads, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout)
+        self.attn_high = nn.ModuleList([
+            CrossAttention3D(channels, num_heads=num_heads, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout)
+            for _ in range(num_high)
+        ])
 
         self.gate_low = nn.Sequential(nn.Conv3d(2 * channels, channels, 1, bias=True), nn.Sigmoid())
         self.gate_high = nn.Sequential(nn.Conv3d(2 * channels, channels, 1, bias=True), nn.Sigmoid())
@@ -382,13 +439,16 @@ class AdaptiveFuse2B3D(nn.Module):
 
 
 class SkipRefinement(nn.Module):
-    def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "instancenorm"):
+    def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "instancenorm",
+                 window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
         super().__init__()
         self.dwt = DWT3D()
         self.idwt = IDWT3D()
 
         self.spa = SpatialGate3D(c, norm=normalization)
-        self.fre = GatedFreqCrossAttn3D(c, num_heads=num_heads, num_high=7)
+        self.fre = GatedFreqCrossAttn3D(
+            c, num_heads=num_heads, num_high=7, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout
+        )
         self.fuse = AdaptiveFuse2B3D(c, norm=normalization)
 
         self.g2_proj = nn.Sequential(
@@ -456,7 +516,8 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self,n_classes=14, n_filters=16, normalization='none', has_dropout=False, has_residual=False):
+    def __init__(self,n_classes=14, n_filters=16, normalization='none', has_dropout=False, has_residual=False,
+                 attn_cfg: Optional[dict] = None):
         super(Decoder, self).__init__()
         self.has_dropout = has_dropout
 
@@ -476,8 +537,32 @@ class Decoder(nn.Module):
         self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
 
-        self.skip1 = SkipRefinement(n_filters,   num_heads=1, g2_channels=n_filters*2, normalization=normalization)
-        self.skip2 = SkipRefinement(n_filters*2, num_heads=2, g2_channels=n_filters*4, normalization=normalization)
+        if attn_cfg is None:
+            attn_cfg = recommended_window_attn_config((96, 96, 96))
+
+        skip1_cfg = attn_cfg.get("skip1", {})
+        skip2_cfg = attn_cfg.get("skip2", {})
+        attn_dropout = attn_cfg.get("attn_dropout", 0.0)
+        proj_dropout = attn_cfg.get("proj_dropout", 0.1)
+
+        self.skip1 = SkipRefinement(
+            n_filters,
+            num_heads=skip1_cfg.get("num_heads", 4),
+            g2_channels=n_filters*2,
+            normalization=normalization,
+            window_size=skip1_cfg.get("window_size", (6, 6, 6)),
+            attn_dropout=attn_dropout,
+            proj_dropout=proj_dropout,
+        )
+        self.skip2 = SkipRefinement(
+            n_filters*2,
+            num_heads=skip2_cfg.get("num_heads", 4),
+            g2_channels=n_filters*4,
+            normalization=normalization,
+            window_size=skip2_cfg.get("window_size", (6, 6, 6)),
+            attn_dropout=attn_dropout,
+            proj_dropout=proj_dropout,
+        )
 
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
@@ -520,7 +605,8 @@ class VNet(nn.Module):
         super(VNet, self).__init__()
         self.num_classes = n_classes
         self.encoder = Encoder(n_channels,n_filters, normalization, has_dropout, has_residual)
-        self.decoder = Decoder(n_classes, n_filters, normalization, has_dropout, has_residual)
+        attn_cfg = recommended_window_attn_config(patch_size)
+        self.decoder = Decoder(n_classes, n_filters, normalization, has_dropout, has_residual, attn_cfg=attn_cfg)
 
     def forward_encoder(self, x):
         return self.encoder(x)
@@ -533,4 +619,3 @@ class VNet(nn.Module):
         out_seg = self.decoder(features)
         return out_seg
     
-
