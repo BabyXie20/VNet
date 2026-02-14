@@ -523,88 +523,6 @@ class MFEC(nn.Module):
 MEFC = MFEC
 
 
-class MFEC(nn.Module):
-    """Multi-expert feature calibration for high-resolution skip features.
-
-    Design for abdominal multi-organ CT (patch 96^3):
-      1) Gate predicts per-expert weights.
-      2) Expert outputs are weighted and concatenated on channel dim.
-      3) 1x1x1 conv fuses back to C channels.
-      4) Residual add with input.
-    """
-
-    def __init__(self, channels: int, normalization: NormType = "instancenorm", num_experts: int = 5):
-        super().__init__()
-        if num_experts != 5:
-            raise ValueError("MFEC is configured for 5 organ-aware experts.")
-
-        # Expert-1: isotropic local context (kidney/pancreas boundary details)
-        exp1 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-        # Expert-2: large field for big organs (liver/spleen/stomach)
-        exp2 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=5, padding=2, groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-        # Expert-3: anisotropic in-plane (handles thicker z-spacing common in CT)
-        exp3 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-        # Expert-4: superior-inferior continuity (vessels / elongated structures)
-        exp4 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0), groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-        # Expert-5: dilated context for small tubular targets (aorta/IVC/esophagus)
-        exp5 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=3, padding=2, dilation=2, groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-        self.experts = nn.ModuleList([exp1, exp2, exp3, exp4, exp5])
-
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Conv3d(channels, max(channels // 4, 8), kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(max(channels // 4, 8), num_experts, kernel_size=1, bias=True),
-        )
-
-        self.fuse = nn.Sequential(
-            nn.Conv3d(num_experts * channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weights = torch.softmax(self.gate(x), dim=1)  # [B, E, 1, 1, 1]
-
-        weighted_expert_outs = []
-        for idx, expert in enumerate(self.experts):
-            y = expert(x)
-            y = y * weights[:, idx:idx + 1]
-            weighted_expert_outs.append(y)
-
-        y = torch.cat(weighted_expert_outs, dim=1)
-        y = self.fuse(y)
-        return x + y
-
-
-MEFC = MFEC
-
-
 class SkipRefinement(nn.Module):
     def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "instancenorm",
                  window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
@@ -623,7 +541,7 @@ class SkipRefinement(nn.Module):
             norm3d(normalization, c),
         )
 
-    def forward(self, x: torch.Tensor, g1: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
         x_spa = self.spa(x)
 
         low, highs = self.dwt(x)
@@ -752,15 +670,13 @@ class Decoder(nn.Module):
         x7 = self.block_seven(x6_up)
         x7_up = self.block_seven_up(x7)
 
-        x2 = self.skip2_mfec(x2)
-        x2=self.skip2(x2,x7_up,x6_up)
+        x2=self.skip2(x2,x6_up)
         x7_up = x7_up + x2
 
         x8 = self.block_eight(x7_up)
         x8_up = self.block_eight_up(x8)
 
-        x1 = self.skip1_mfec(x1)
-        x1=self.skip1(x1,x8_up,x7_up)
+        x1=self.skip1(x1,x7_up)
         x8_up = x8_up + x1
 
         x9 = self.block_nine(x8_up)
