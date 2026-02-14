@@ -101,6 +101,256 @@ class IDWT3D(nn.Module):
             groups=C
         )
         return x  
+
+
+class LayerNormChannelFirst(nn.Module):
+    """LayerNorm on channel dimension for (B, C, D, H, W)."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.norm(x)
+        return x.permute(0, 4, 1, 2, 3).contiguous()
+
+
+class Mlp3d(nn.Module):
+    def __init__(self, dim: int, hidden_dim: Optional[int] = None, dropout: float = 0.0):
+        super().__init__()
+        hidden_dim = hidden_dim or dim * 4
+        self.fc1 = nn.Conv3d(dim, hidden_dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Conv3d(hidden_dim, dim, kernel_size=1)
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+
+def window_partition(x: torch.Tensor, window_size: Tuple[int, int, int]) -> torch.Tensor:
+    # x: (B, D, H, W, C)
+    b, d, h, w, c = x.shape
+    wd, wh, ww = window_size
+    x = x.view(b, d // wd, wd, h // wh, wh, w // ww, ww, c)
+    windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous()
+    return windows.view(-1, wd * wh * ww, c)
+
+
+def window_reverse(windows: torch.Tensor, window_size: Tuple[int, int, int], b: int, d: int, h: int, w: int, c: int) -> torch.Tensor:
+    wd, wh, ww = window_size
+    x = windows.view(b, d // wd, h // wh, w // ww, wd, wh, ww, c)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous()
+    return x.view(b, d, h, w, c)
+
+
+def compute_mask(d: int, h: int, w: int, window_size: Tuple[int, int, int], shift_size: Tuple[int, int, int], device: torch.device) -> torch.Tensor:
+    wd, wh, ww = window_size
+    sd, sh, sw = shift_size
+    mask = torch.zeros((1, d, h, w, 1), device=device)
+    d_slices = (slice(0, -wd), slice(-wd, -sd), slice(-sd, None))
+    h_slices = (slice(0, -wh), slice(-wh, -sh), slice(-sh, None))
+    w_slices = (slice(0, -ww), slice(-ww, -sw), slice(-sw, None))
+    cnt = 0
+    for ds in d_slices:
+        for hs in h_slices:
+            for ws in w_slices:
+                mask[:, ds, hs, ws, :] = cnt
+                cnt += 1
+    mask_windows = window_partition(mask, window_size).squeeze(-1)
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+    return attn_mask
+
+
+class RelPosBias3D(nn.Module):
+    def __init__(self, window_size: Tuple[int, int, int], num_heads: int):
+        super().__init__()
+        self.window_size = window_size
+        wd, wh, ww = window_size
+        size = (2 * wd - 1) * (2 * wh - 1) * (2 * ww - 1)
+        self.table = nn.Parameter(torch.zeros(size, num_heads))
+
+        coords = torch.stack(torch.meshgrid(
+            torch.arange(wd), torch.arange(wh), torch.arange(ww), indexing="ij"
+        ))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += wd - 1
+        relative_coords[:, :, 1] += wh - 1
+        relative_coords[:, :, 2] += ww - 1
+        relative_coords[:, :, 0] *= (2 * wh - 1) * (2 * ww - 1)
+        relative_coords[:, :, 1] *= (2 * ww - 1)
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+        nn.init.trunc_normal_(self.table, std=0.02)
+
+    def forward(self) -> torch.Tensor:
+        wd, wh, ww = self.window_size
+        n = wd * wh * ww
+        bias = self.table[self.relative_position_index.view(-1)].view(n, n, -1)
+        return bias.permute(2, 0, 1).contiguous()
+
+
+class CrossWindowAttention3D(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 4, window_size: Tuple[int, int, int] = (6, 6, 6),
+                 qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0, use_rel_pos_bias: bool = True):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads}).")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q = nn.Conv3d(dim, dim, kernel_size=1, bias=qkv_bias)
+        self.k = nn.Conv3d(dim, dim, kernel_size=1, bias=qkv_bias)
+        self.v = nn.Conv3d(dim, dim, kernel_size=1, bias=qkv_bias)
+        self.proj = nn.Conv3d(dim, dim, kernel_size=1)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.rel_pos = RelPosBias3D(window_size, num_heads) if use_rel_pos_bias else None
+
+    def _pad_to_window(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+        _, _, d, h, w = x.shape
+        wd, wh, ww = self.window_size
+        pd = (wd - d % wd) % wd
+        ph = (wh - h % wh) % wh
+        pw = (ww - w % ww) % ww
+        if pd or ph or pw:
+            x = F.pad(x, (0, pw, 0, ph, 0, pd))
+        return x, (pd, ph, pw)
+
+    def forward(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, use_shift: bool = False) -> torch.Tensor:
+        b, c, d, h, w = q_in.shape
+        q = self.q(q_in)
+        k = self.k(k_in)
+        v = self.v(v_in)
+
+        q, pad = self._pad_to_window(q)
+        k, _ = self._pad_to_window(k)
+        v, _ = self._pad_to_window(v)
+        pd, ph, pw = pad
+        dp, hp, wp = d + pd, h + ph, w + pw
+
+        shift_size = tuple(ws // 2 for ws in self.window_size) if use_shift else (0, 0, 0)
+        if use_shift:
+            q = torch.roll(q, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(2, 3, 4))
+            k = torch.roll(k, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(2, 3, 4))
+            v = torch.roll(v, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(2, 3, 4))
+
+        q = window_partition(q.permute(0, 2, 3, 4, 1).contiguous(), self.window_size)
+        k = window_partition(k.permute(0, 2, 3, 4, 1).contiguous(), self.window_size)
+        v = window_partition(v.permute(0, 2, 3, 4, 1).contiguous(), self.window_size)
+
+        nw, n, _ = q.shape
+        q = q.view(nw, n, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(nw, n, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(nw, n, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+        if self.rel_pos is not None:
+            attn = attn + self.rel_pos().unsqueeze(0)
+
+        if use_shift:
+            mask = compute_mask(dp, hp, wp, self.window_size, shift_size, q_in.device)
+            nW = mask.shape[0]
+            attn = attn.view(b, nW, self.num_heads, n, n)
+            attn = attn + mask.unsqueeze(0).unsqueeze(2)
+            attn = attn.view(-1, self.num_heads, n, n)
+
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        out = (attn @ v).permute(0, 2, 1, 3).reshape(nw, n, c)
+
+        out = window_reverse(out, self.window_size, b, dp, hp, wp, c)
+        if use_shift:
+            out = torch.roll(out, shifts=shift_size, dims=(1, 2, 3))
+        out = out[:, :d, :h, :w, :].permute(0, 4, 1, 2, 3).contiguous()
+        out = self.proj_drop(self.proj(out))
+        return out
+
+
+class FreCrossAttBlock(nn.Module):
+    """Frequency-domain cross-attention skip fusion block for 3D VNet."""
+
+    def __init__(self, dim: int, dwt3d: nn.Module, idwt3d: nn.Module, num_heads: int = 4,
+                 window_size: Tuple[int, int, int] = (6, 6, 6), use_shift: bool = False,
+                 mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.dim = dim
+        self.use_shift = use_shift
+        self.dwt3d = dwt3d
+        self.idwt3d = idwt3d
+
+        hidden = int(dim * mlp_ratio)
+        self.q_proj = nn.ModuleList([nn.Conv3d(dim, dim, kernel_size=1) for _ in range(7)])
+        self.q_norm = nn.ModuleList([LayerNormChannelFirst(dim) for _ in range(7)])
+        self.q_mlp = nn.ModuleList([Mlp3d(dim, hidden_dim=hidden, dropout=dropout) for _ in range(7)])
+
+        self.k_proj = nn.Conv3d(dim, dim, kernel_size=1)
+        self.k_norm = LayerNormChannelFirst(dim)
+        self.k_mlp = Mlp3d(dim, hidden_dim=hidden, dropout=dropout)
+
+        self.v_fuse = nn.Conv3d(3 * dim, dim, kernel_size=1)
+        self.v_norm = LayerNormChannelFirst(dim)
+        self.v_mlp = Mlp3d(dim, hidden_dim=hidden, dropout=dropout)
+
+        self.cross_attn = CrossWindowAttention3D(dim=dim, num_heads=num_heads, window_size=window_size, proj_drop=dropout)
+        self.rec_norm = nn.ModuleList([LayerNormChannelFirst(dim) for _ in range(7)])
+        self.rec_mlp = nn.ModuleList([Mlp3d(dim, hidden_dim=hidden, dropout=dropout) for _ in range(7)])
+        self.low_norm = LayerNormChannelFirst(dim)
+        self.low_mlp = Mlp3d(dim, hidden_dim=hidden, dropout=dropout)
+
+    @staticmethod
+    def _residual_ffn(x: torch.Tensor, norm: nn.Module, mlp: nn.Module) -> torch.Tensor:
+        return x + mlp(norm(x))
+
+    def _split_subbands(self, e_l: torch.Tensor) -> list[torch.Tensor]:
+        parts = self.dwt3d(e_l)
+        if isinstance(parts, (tuple, list)) and len(parts) == 2:
+            low, highs = parts
+            return [low] + [highs[:, :, i, ...] for i in range(highs.shape[2])]
+        if isinstance(parts, (tuple, list)) and len(parts) == 8:
+            return list(parts)
+        raise RuntimeError("DWT3D output format must be (low, highs[7]) or 8 sub-bands.")
+
+    def _merge_subbands(self, subbands: list[torch.Tensor]) -> torch.Tensor:
+        low = subbands[0]
+        highs = torch.stack(subbands[1:], dim=2)
+        try:
+            return self.idwt3d(low, highs)
+        except TypeError:
+            return self.idwt3d(subbands)
+
+    def forward(self, e_l: torch.Tensor, u_l: torch.Tensor, use_shift: Optional[bool] = None) -> torch.Tensor:
+        shift = self.use_shift if use_shift is None else use_shift
+        subbands = self._split_subbands(e_l)
+        p_lll = subbands[0]
+        highs = subbands[1:]
+
+        k = self._residual_ffn(self.k_proj(p_lll), self.k_norm, self.k_mlp)
+        v_in = torch.cat([u_l, p_lll], dim=1)
+        v = self._residual_ffn(self.v_fuse(v_in), self.v_norm, self.v_mlp)
+
+        high_hat = []
+        for i, p_h in enumerate(highs):
+            q = self._residual_ffn(self.q_proj[i](p_h), self.q_norm[i], self.q_mlp[i])
+            z = self.cross_attn(q, k, v, use_shift=shift)
+            r = self.rec_mlp[i](self.rec_norm[i](z))
+            high_hat.append(p_h + r)
+
+        p_lll_hat = p_lll + self.low_mlp(self.low_norm(v))
+        return self._merge_subbands([p_lll_hat] + high_hat)
     
 
 class ConvBlock(nn.Module):
