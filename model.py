@@ -221,7 +221,6 @@ class UpsamplingDeconvBlock(nn.Module):
 
 
 class DWC1x1x1(nn.Module):
-    """1x1x1 depthwise conv: groups=C"""
     def __init__(self, channels, bias=True):
         super().__init__()
         self.conv = nn.Conv3d(channels, channels, kernel_size=1, groups=channels, bias=bias)
@@ -231,14 +230,6 @@ class DWC1x1x1(nn.Module):
 
 
 class CrossAttention3D(nn.Module):
-    """
-    Window-based cross-attention for 3D feature maps.
-
-    The window partition/reverse path follows the same idea used in MONAI Swin
-    blocks: partition local 3D windows, run attention inside each window, then
-    restore the full volume.
-    """
-
     def __init__(self, channels, num_heads=8, window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         assert channels % num_heads == 0
@@ -312,12 +303,6 @@ class CrossAttention3D(nn.Module):
 
 
 def recommended_window_attn_config(patch_size: int | Sequence[int] = (96, 96, 96)):
-    """Recommended window-attention setup for 3D medical segmentation.
-
-    For patch size (96, 96, 96), skip features after DWT are typically 48^3 and
-    24^3, both divisible by (6, 6, 6), which keeps local context and memory in
-    good balance.
-    """
     if isinstance(patch_size, int):
         patch_size = (patch_size, patch_size, patch_size)
 
@@ -390,15 +375,10 @@ class GatedFreqCrossAttn3D(nn.Module):
         return low_out, highs_out
     
 
-
 class CrossDomainBlcok(nn.Module):
-    """Cross-domain fusion with dual-stat recalibration and bi-directional interaction."""
-
     def __init__(self, c: int, norm: str = "instancenorm"):
         super().__init__()
-        inter = max(c // 4, 8)
-
-        # 2-path statistics: avg pool + max pool for each domain.
+        inter = c
         self.spa_mlp = nn.Sequential(
             nn.Conv3d(2 * c, inter, kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
@@ -412,7 +392,6 @@ class CrossDomainBlcok(nn.Module):
             nn.Sigmoid(),
         )
 
-        # bi-directional multiplicative interaction in channel domain
         self.s2f = nn.Sequential(nn.Conv3d(c, c, 1, bias=False), norm3d(norm, c), nn.Sigmoid())
         self.f2s = nn.Sequential(nn.Conv3d(c, c, 1, bias=False), norm3d(norm, c), nn.Sigmoid())
 
@@ -442,15 +421,6 @@ class CrossDomainBlcok(nn.Module):
 
 
 class MFEC(nn.Module):
-    """Multi-expert feature calibration for high-resolution skip features.
-
-    Design for abdominal multi-organ CT (patch 96^3):
-      1) Gate predicts per-expert weights.
-      2) Expert outputs are weighted and concatenated on channel dim.
-      3) 1x1x1 conv fuses back to C channels.
-      4) Residual add with input.
-    """
-
     def __init__(self, channels: int, normalization: NormType = "instancenorm", num_experts: int = 5):
         super().__init__()
         if num_experts != 5:
@@ -520,9 +490,6 @@ class MFEC(nn.Module):
         return x + y
 
 
-MEFC = MFEC
-
-
 class SkipRefinement(nn.Module):
     def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "instancenorm",
                  window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
@@ -553,7 +520,6 @@ class SkipRefinement(nn.Module):
 
         out = self.fuse(x_spa, x_fre)
         return out
-
 
     
 class Encoder(nn.Module):
