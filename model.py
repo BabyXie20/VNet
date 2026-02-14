@@ -741,35 +741,36 @@ class MFEC(nn.Module):
 
 
 class SkipRefinement(nn.Module):
-    def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "instancenorm",
-                 window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
+    def __init__(self, c: int, g2_channels: int, window_size: Tuple[int, int, int] = (6, 8, 8),
+                 use_shift: bool = True, dropout: float = 0.0):
         super().__init__()
-        self.dwt = DWT3D()
-        self.idwt = IDWT3D()
+        if g2_channels != 2 * c:
+            raise ValueError(f"Expected g2_channels == 2*c, got {g2_channels} and c={c}.")
+        if c == 16:
+            num_heads = 2
+        elif c == 32:
+            num_heads = 4
+        else:
+            raise ValueError(f"SkipRefinement expects c in {{16, 32}}, but got {c}.")
 
-        self.spa = MFEC(c, normalization=normalization)
-        self.fre = GatedFreqCrossAttn3D(
-            c, num_heads=num_heads, num_high=7, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout
+        self.fre = FreCrossAttBlock(
+            dim=c,
+            dwt3d=DWT3D(),
+            idwt3d=IDWT3D(),
+            num_heads=num_heads,
+            window_size=window_size,
+            use_shift=use_shift,
+            dropout=dropout,
         )
-        self.fuse = CrossDomainBlcok(c, norm=normalization)
 
-        self.g2_proj = nn.Sequential(
-            nn.Conv3d(g2_channels, c, kernel_size=1, bias=False),
-            norm3d(normalization, c),
-        )
-
-    def forward(self, x: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
-        x_spa = self.spa(x)
-
-        low, highs = self.dwt(x)
-
-        g2 = self.g2_proj(g2)
-
-        low2, highs2 = self.fre(low, highs, g2)
-        x_fre = self.idwt(low2, highs2)
-
-        out = self.fuse(x_spa, x_fre)
-        return out
+    def forward(self, enc_skip: torch.Tensor, dec_half: torch.Tensor) -> torch.Tensor:
+        if dec_half.shape[1] == 2 * enc_skip.shape[1]:
+            dec_in = dec_half
+        else:
+            raise ValueError(
+                f"Decoder half-scale feature channels must be 2x skip channels, got {dec_half.shape[1]} vs {enc_skip.shape[1]}."
+            )
+        return self.fre(enc_skip, dec_in)
 
     
 class Encoder(nn.Module):
@@ -838,34 +839,19 @@ class Decoder(nn.Module):
         self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
 
-        if attn_cfg is None:
-            attn_cfg = recommended_window_attn_config((96, 96, 96))
-
-        skip1_cfg = attn_cfg.get("skip1", {})
-        skip2_cfg = attn_cfg.get("skip2", {})
-        attn_dropout = attn_cfg.get("attn_dropout", 0.0)
-        proj_dropout = attn_cfg.get("proj_dropout", 0.1)
-
+        # patch_size=96, n_filters=16: use FreCrossAttBlock with fixed window_size and heads.
         self.skip1 = SkipRefinement(
             n_filters,
-            num_heads=skip1_cfg.get("num_heads", 4),
-            g2_channels=n_filters*2,
-            normalization=normalization,
-            window_size=skip1_cfg.get("window_size", (6, 6, 6)),
-            attn_dropout=attn_dropout,
-            proj_dropout=proj_dropout,
+            g2_channels=n_filters * 2,
+            window_size=(6, 8, 8),
+            use_shift=True,
         )
         self.skip2 = SkipRefinement(
-            n_filters*2,
-            num_heads=skip2_cfg.get("num_heads", 4),
-            g2_channels=n_filters*4,
-            normalization=normalization,
-            window_size=skip2_cfg.get("window_size", (6, 6, 6)),
-            attn_dropout=attn_dropout,
-            proj_dropout=proj_dropout,
+            n_filters * 2,
+            g2_channels=n_filters * 4,
+            window_size=(6, 8, 8),
+            use_shift=True,
         )
-        self.skip1_mfec = MFEC(n_filters, normalization=normalization)
-        self.skip2_mfec = MFEC(n_filters * 2, normalization=normalization)
 
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
