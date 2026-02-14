@@ -390,52 +390,137 @@ class GatedFreqCrossAttn3D(nn.Module):
         return low_out, highs_out
     
 
-class SpatialGate3D(nn.Module):
-    def __init__(self, c: int, inter: int | None = None, norm: str = "instancenorm"):
-        super().__init__()
-        inter = inter or max(c // 2, 8)
 
-        self.wx = nn.Conv3d(c, inter, 1, bias=False)
-        self.wg = nn.Conv3d(c, inter, 1, bias=False)
-        self.psi = nn.Conv3d(inter, 1, 1, bias=True)
+class CrossDomainBlcok(nn.Module):
+    """Cross-domain fusion with dual-stat recalibration and bi-directional interaction."""
 
-        self.nx = norm3d(norm, inter)
-        self.ng = norm3d(norm, inter)
-
-        self.refine = nn.Sequential(
-            nn.Conv3d(c, c, 3, padding=1, bias=False),
-            norm3d(norm, c),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    
-        a = F.relu(self.nx(self.wx(x)) + self.ng(self.wg(g)), inplace=True)
-        alpha = torch.sigmoid(self.psi(a))  
-        x = x * alpha
-        return self.refine(x) + x  
-
-
-class AdaptiveFuse2B3D(nn.Module):
     def __init__(self, c: int, norm: str = "instancenorm"):
         super().__init__()
-        self.logit = nn.Sequential(
-            nn.Conv3d(3 * c, c, 1, bias=False),
-            norm3d(norm, c),
+        inter = max(c // 4, 8)
+
+        # 2-path statistics: avg pool + max pool for each domain.
+        self.spa_mlp = nn.Sequential(
+            nn.Conv3d(2 * c, inter, kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv3d(c, 2, 1, bias=True),  # 2 logits: spa vs fre
+            nn.Conv3d(inter, c, kernel_size=1, bias=True),
+            nn.Sigmoid(),
         )
-        self.out = nn.Sequential(
-            nn.Conv3d(c, c, 1, bias=False),
+        self.fre_mlp = nn.Sequential(
+            nn.Conv3d(2 * c, inter, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(inter, c, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+        # bi-directional multiplicative interaction in channel domain
+        self.s2f = nn.Sequential(nn.Conv3d(c, c, 1, bias=False), norm3d(norm, c), nn.Sigmoid())
+        self.f2s = nn.Sequential(nn.Conv3d(c, c, 1, bias=False), norm3d(norm, c), nn.Sigmoid())
+
+        self.proj = nn.Sequential(
+            nn.Conv3d(2 * c, c, kernel_size=1, bias=False),
             norm3d(norm, c),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x_spa: torch.Tensor, x_fre: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        logits = self.logit(torch.cat([x_spa, x_fre, g], dim=1))  # [B,2,D,H,W]
-        w = torch.softmax(logits, dim=1)
-        y = w[:, 0:1] * x_spa + w[:, 1:2] * x_fre
-        return self.out(y)
+    def _dual_stats(self, x: torch.Tensor) -> torch.Tensor:
+        avg_stat = F.adaptive_avg_pool3d(x, 1)
+        max_stat = F.adaptive_max_pool3d(x, 1)
+        return torch.cat([avg_stat, max_stat], dim=1)
+
+    def forward(self, x_spa: torch.Tensor, x_fre: torch.Tensor) -> torch.Tensor:
+        w_spa = self.spa_mlp(self._dual_stats(x_spa))
+        w_fre = self.fre_mlp(self._dual_stats(x_fre))
+
+        x_spa_cal = x_spa * w_spa
+        x_fre_cal = x_fre * w_fre
+
+        y_spa = x_spa_cal * self.f2s(x_fre_cal)
+        y_fre = x_fre_cal * self.s2f(x_spa_cal)
+
+        y = torch.cat([y_spa, y_fre], dim=1)
+        return self.proj(y)
+
+
+class MFEC(nn.Module):
+    """Multi-expert feature calibration for high-resolution skip features.
+
+    Design for abdominal multi-organ CT (patch 96^3):
+      1) Gate predicts per-expert weights.
+      2) Expert outputs are weighted and concatenated on channel dim.
+      3) 1x1x1 conv fuses back to C channels.
+      4) Residual add with input.
+    """
+
+    def __init__(self, channels: int, normalization: NormType = "instancenorm", num_experts: int = 5):
+        super().__init__()
+        if num_experts != 5:
+            raise ValueError("MFEC is configured for 5 organ-aware experts.")
+
+        # Expert-1: isotropic local context (kidney/pancreas boundary details)
+        exp1 = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            norm3d(normalization, channels),
+            nn.ReLU(inplace=True),
+        )
+        # Expert-2: large field for big organs (liver/spleen/stomach)
+        exp2 = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=5, padding=2, groups=channels, bias=False),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            norm3d(normalization, channels),
+            nn.ReLU(inplace=True),
+        )
+        # Expert-3: anisotropic in-plane (handles thicker z-spacing common in CT)
+        exp3 = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), groups=channels, bias=False),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            norm3d(normalization, channels),
+            nn.ReLU(inplace=True),
+        )
+        # Expert-4: superior-inferior continuity (vessels / elongated structures)
+        exp4 = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0), groups=channels, bias=False),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            norm3d(normalization, channels),
+            nn.ReLU(inplace=True),
+        )
+        # Expert-5: dilated context for small tubular targets (aorta/IVC/esophagus)
+        exp5 = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=3, padding=2, dilation=2, groups=channels, bias=False),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            norm3d(normalization, channels),
+            nn.ReLU(inplace=True),
+        )
+        self.experts = nn.ModuleList([exp1, exp2, exp3, exp4, exp5])
+
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(channels, max(channels // 4, 8), kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(max(channels // 4, 8), num_experts, kernel_size=1, bias=True),
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Conv3d(num_experts * channels, channels, kernel_size=1, bias=False),
+            norm3d(normalization, channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.gate(x), dim=1)  # [B, E, 1, 1, 1]
+
+        weighted_expert_outs = []
+        for idx, expert in enumerate(self.experts):
+            y = expert(x)
+            y = y * weights[:, idx:idx + 1]
+            weighted_expert_outs.append(y)
+
+        y = torch.cat(weighted_expert_outs, dim=1)
+        y = self.fuse(y)
+        return x + y
+
+
+MEFC = MFEC
 
 
 class SkipRefinement(nn.Module):
@@ -445,11 +530,11 @@ class SkipRefinement(nn.Module):
         self.dwt = DWT3D()
         self.idwt = IDWT3D()
 
-        self.spa = SpatialGate3D(c, norm=normalization)
+        self.spa = MFEC(c, normalization=normalization)
         self.fre = GatedFreqCrossAttn3D(
             c, num_heads=num_heads, num_high=7, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout
         )
-        self.fuse = AdaptiveFuse2B3D(c, norm=normalization)
+        self.fuse = CrossDomainBlcok(c, norm=normalization)
 
         self.g2_proj = nn.Sequential(
             nn.Conv3d(g2_channels, c, kernel_size=1, bias=False),
@@ -457,7 +542,7 @@ class SkipRefinement(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, g1: torch.Tensor, g2: torch.Tensor) -> torch.Tensor:
-        x_spa = self.spa(x, g1)
+        x_spa = self.spa(x)
 
         low, highs = self.dwt(x)
 
@@ -466,7 +551,7 @@ class SkipRefinement(nn.Module):
         low2, highs2 = self.fre(low, highs, g2)
         x_fre = self.idwt(low2, highs2)
 
-        out = self.fuse(x_spa, x_fre, g1)
+        out = self.fuse(x_spa, x_fre)
         return out
 
 
