@@ -648,6 +648,8 @@ class Decoder(nn.Module):
             attn_dropout=attn_dropout,
             proj_dropout=proj_dropout,
         )
+        self.skip1_mfec = MFEC(n_filters, normalization=normalization)
+        self.skip2_mfec = MFEC(n_filters * 2, normalization=normalization)
 
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
