@@ -516,63 +516,98 @@ class MFEC(nn.Module):
         if num_experts != 5:
             raise ValueError("MFEC is configured for 5 organ-aware experts.")
 
+        dropout_rate = 0.1
+
+        def depthwise_separable_conv3d(in_channels: int, out_channels: int, kernel_size, padding, dilation=1):
+            return nn.Sequential(
+                nn.Conv3d(
+                    in_channels,
+                    in_channels,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=in_channels,
+                    bias=False,
+                ),
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False),
+                norm3d(normalization, out_channels),
+                nn.LeakyReLU(negative_slope=0.1, inplace=True),
+                nn.Dropout3d(dropout_rate),
+            )
+
         # Expert-1: isotropic local context (kidney/pancreas boundary details)
         exp1 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
+            depthwise_separable_conv3d(channels, channels, kernel_size=3, padding=1),
         )
         # Expert-2: large field for big organs (liver/spleen/stomach)
         exp2 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=5, padding=2, groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
+            depthwise_separable_conv3d(channels, channels, kernel_size=5, padding=2),
+            depthwise_separable_conv3d(channels, channels, kernel_size=3, padding=1),
         )
         # Expert-3: anisotropic in-plane (handles thicker z-spacing common in CT)
         exp3 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
+            depthwise_separable_conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
         )
         # Expert-4: superior-inferior continuity (vessels / elongated structures)
         exp4 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0), groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
+            depthwise_separable_conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
         )
-        # Expert-5: dilated context for small tubular targets (aorta/IVC/esophagus)
-        exp5 = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=3, padding=2, dilation=2, groups=channels, bias=False),
-            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
-            norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
-        )
-        self.experts = nn.ModuleList([exp1, exp2, exp3, exp4, exp5])
 
-        self.gate = nn.Sequential(
+        # Expert-5: dilated context for small tubular targets (aorta/IVC/esophagus)
+        exp5_pre = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        exp5_branch_channels = max(channels // 2, 1)
+        exp5_branch1 = depthwise_separable_conv3d(channels, exp5_branch_channels, kernel_size=3, padding=2, dilation=2)
+        exp5_branch2 = depthwise_separable_conv3d(channels, exp5_branch_channels, kernel_size=3, padding=4, dilation=4)
+        exp5_post = nn.Sequential(
+            nn.Conv3d(2 * exp5_branch_channels, channels, kernel_size=1, bias=False),
+            nn.Dropout3d(dropout_rate),
+        )
+
+        gate_hidden = max(channels // 4, 8)
+        self.gate_avg = nn.Sequential(
             nn.AdaptiveAvgPool3d(1),
-            nn.Conv3d(channels, max(channels // 4, 8), kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(max(channels // 4, 8), num_experts, kernel_size=1, bias=True),
+            nn.Conv3d(channels, gate_hidden, kernel_size=1, bias=True),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Dropout3d(dropout_rate),
+            nn.Conv3d(gate_hidden, num_experts, kernel_size=1, bias=True),
+        )
+        self.gate_max = nn.Sequential(
+            nn.AdaptiveMaxPool3d(1),
+            nn.Conv3d(channels, gate_hidden, kernel_size=1, bias=True),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Dropout3d(dropout_rate),
+            nn.Conv3d(gate_hidden, num_experts, kernel_size=1, bias=True),
         )
 
         self.fuse = nn.Sequential(
             nn.Conv3d(num_experts * channels, channels, kernel_size=1, bias=False),
             norm3d(normalization, channels),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Dropout3d(dropout_rate),
         )
 
+        self.exp5_pre = exp5_pre
+        self.exp5_branch1 = exp5_branch1
+        self.exp5_branch2 = exp5_branch2
+        self.exp5_post = exp5_post
+
+        self.experts = nn.ModuleList([exp1, exp2, exp3, exp4, nn.Identity()])
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weights = torch.softmax(self.gate(x), dim=1)  # [B, E, 1, 1, 1]
+        B, _, D, H, W = x.shape
+
+        weights = torch.softmax(self.gate_avg(x) + self.gate_max(x), dim=1)  # [B, E, 1, 1, 1]
 
         weighted_expert_outs = []
         for idx, expert in enumerate(self.experts):
-            y = expert(x)
-            y = y * weights[:, idx:idx + 1]
+            if idx == 4:
+                x_exp5 = self.exp5_pre(x)
+                y = torch.cat([self.exp5_branch1(x_exp5), self.exp5_branch2(x_exp5)], dim=1)
+                y = self.exp5_post(y)
+            else:
+                y = expert(x)
+
+            y = y * weights[:, idx:idx + 1].expand(B, 1, D, H, W)
             weighted_expert_outs.append(y)
 
         y = torch.cat(weighted_expert_outs, dim=1)
