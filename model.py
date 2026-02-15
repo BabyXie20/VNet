@@ -210,76 +210,175 @@ class DWC1x1x1(nn.Module):
 
 
 class CrossAttention3D(nn.Module):
-    def __init__(self, channels, num_heads=8, window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout=0.0, proj_dropout=0.0):
+    def __init__(
+        self,
+        channels,
+        num_heads=8,
+        window_size: Tuple[int, int, int] = (6, 8, 8),
+        shift_size: Tuple[int, int, int] = (3, 4, 4),
+        attn_dropout=0.0,
+        proj_dropout=0.0,
+    ):
         super().__init__()
         assert channels % num_heads == 0
         self.c = channels
         self.h = num_heads
         self.dh = channels // num_heads
         self.window_size = tuple(window_size)
+        self.shift_size = tuple(shift_size)
+
+        wd, wh, ww = self.window_size
+        sd, sh, sw = self.shift_size
+        assert 0 <= sd < wd and 0 <= sh < wh and 0 <= sw < ww, "shift_size must be in [0, window_size)"
 
         self.norm_q = nn.LayerNorm(channels)
         self.norm_kv = nn.LayerNorm(channels)
 
         self.proj = nn.Linear(channels, channels)
         self.proj_drop = nn.Dropout(proj_dropout)
-        self.attn_drop = attn_dropout
+        self.attn_drop = float(attn_dropout)
 
-    def _window_partition(self, x: torch.Tensor):
+        # 简单缓存：按 (Dp,Hp,Wp,device,dtype) 缓存 mask
+        self._mask_cache = {}
+
+    def _pad_to_window(self, x: torch.Tensor):
         # x: [B, D, H, W, C]
         B, D, H, W, C = x.shape
         wd, wh, ww = self.window_size
-
         pd = (wd - D % wd) % wd
         ph = (wh - H % wh) % wh
         pw = (ww - W % ww) % ww
-        if pd > 0 or ph > 0 or pw > 0:
+        if pd or ph or pw:
             x = F.pad(x, (0, 0, 0, pw, 0, ph, 0, pd))
+        return x, (D, H, W, D + pd, H + ph, W + pw, pd, ph, pw)
 
-        Dp, Hp, Wp = D + pd, H + ph, W + pw
-        x = x.view(B, Dp // wd, wd, Hp // wh, wh, Wp // ww, ww, C)
-        windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, wd * wh * ww, C)
-        return windows, (D, H, W, Dp, Hp, Wp)
-
-    def _window_reverse(self, windows: torch.Tensor, shape_meta):
-        D, H, W, Dp, Hp, Wp = shape_meta
+    def _window_partition_no_pad(self, x: torch.Tensor):
+        # x: [B, Dp, Hp, Wp, C] where divisible by window_size
+        B, Dp, Hp, Wp, C = x.shape
         wd, wh, ww = self.window_size
-        B = windows.shape[0] // ((Dp // wd) * (Hp // wh) * (Wp // ww))
+        x = x.view(B, Dp // wd, wd, Hp // wh, wh, Wp // ww, ww, C)
+        windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous()
+        windows = windows.view(-1, wd * wh * ww, C)  # [B*nW, N, C]
+        return windows
 
-        x = windows.view(B, Dp // wd, Hp // wh, Wp // ww, wd, wh, ww, self.c)
-        x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, Dp, Hp, Wp, self.c)
-        return x[:, :D, :H, :W, :]
+    def _window_reverse_no_pad(self, windows: torch.Tensor, B: int, Dp: int, Hp: int, Wp: int):
+        # windows: [B*nW, N, C]
+        wd, wh, ww = self.window_size
+        C = windows.shape[-1]
+        nW = (Dp // wd) * (Hp // wh) * (Wp // ww)
+        assert windows.shape[0] == B * nW
+        x = windows.view(B, Dp // wd, Hp // wh, Wp // ww, wd, wh, ww, C)
+        x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, Dp, Hp, Wp, C)
+        return x
+
+    def _get_attn_mask(self, Dp: int, Hp: int, Wp: int, device, dtype):
+        # 返回 shape: [nW, N, N] (单个样本的所有窗口)
+        key = (Dp, Hp, Wp, device.type, device.index, str(dtype))
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+
+        wd, wh, ww = self.window_size
+        sd, sh, sw = self.shift_size
+        N = wd * wh * ww
+
+        # img_mask: [1, Dp, Hp, Wp, 1]，按 3x3x3 区域打标签（Swin 标准做法的 3D 扩展）
+        img_mask = torch.zeros((1, Dp, Hp, Wp, 1), device=device, dtype=torch.int32)
+        cnt = 0
+
+        d_slices = (slice(0, -wd), slice(-wd, -sd), slice(-sd, None)) if sd > 0 else (slice(0, None),)
+        h_slices = (slice(0, -wh), slice(-wh, -sh), slice(-sh, None)) if sh > 0 else (slice(0, None),)
+        w_slices = (slice(0, -ww), slice(-ww, -sw), slice(-sw, None)) if sw > 0 else (slice(0, None),)
+
+        for ds in d_slices:
+            for hs in h_slices:
+                for ws in w_slices:
+                    img_mask[:, ds, hs, ws, :] = cnt
+                    cnt += 1
+
+        mask_windows = self._window_partition_no_pad(img_mask).view(-1, N)  # [nW, N]
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)    # [nW, N, N]
+
+        neg = torch.finfo(dtype).min
+        attn_mask = attn_mask.to(device=device)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, neg).masked_fill(attn_mask == 0, 0.0)
+        attn_mask = attn_mask.to(dtype=dtype)  # 与 q 同 dtype 更省显存
+
+        self._mask_cache[key] = attn_mask
+        return attn_mask
 
     def forward(self, q_map, k_map, v_map):
+        # 输入: [B,C,D,H,W]
         q_map = q_map.permute(0, 2, 3, 4, 1).contiguous()  # [B,D,H,W,C]
         k_map = k_map.permute(0, 2, 3, 4, 1).contiguous()
         v_map = v_map.permute(0, 2, 3, 4, 1).contiguous()
 
-        q, shp = self._window_partition(q_map)
-        k, _ = self._window_partition(k_map)
-        v, _ = self._window_partition(v_map)
+        B0, D, H, W, C = q_map.shape
 
+        # 1) pad（先 pad，再 shift）
+        q_pad, meta = self._pad_to_window(q_map)
+        _, _, _, Dp, Hp, Wp, pd, ph, pw = meta
+
+        if pd or ph or pw:
+            k_pad = F.pad(k_map, (0, 0, 0, pw, 0, ph, 0, pd))
+            v_pad = F.pad(v_map, (0, 0, 0, pw, 0, ph, 0, pd))
+        else:
+            k_pad, v_pad = k_map, v_map
+
+        # 2) cyclic shift
+        sd, sh, sw = self.shift_size
+        use_shift = (sd != 0) or (sh != 0) or (sw != 0)
+        if use_shift:
+            q_pad = torch.roll(q_pad, shifts=(-sd, -sh, -sw), dims=(1, 2, 3))
+            k_pad = torch.roll(k_pad, shifts=(-sd, -sh, -sw), dims=(1, 2, 3))
+            v_pad = torch.roll(v_pad, shifts=(-sd, -sh, -sw), dims=(1, 2, 3))
+
+        # 3) window partition（此时 Dp/Hp/Wp 都能整除 window_size）
+        q = self._window_partition_no_pad(q_pad)  # [B0*nW, N, C]
+        k = self._window_partition_no_pad(k_pad)
+        v = self._window_partition_no_pad(v_pad)
+
+        # LN
         q = self.norm_q(q)
         k = self.norm_kv(k)
         v = self.norm_kv(v)
 
-        B, Nq, C = q.shape
+        Bwin, Nq, _ = q.shape  # Bwin = B0*nW
         Nk = k.shape[1]
+        assert Nq == Nk, "Swin window attention expects same token count per window."
 
-        q = q.view(B, Nq, self.h, self.dh).transpose(1, 2)  # (BnW,h,Nq,dh)
-        k = k.view(B, Nk, self.h, self.dh).transpose(1, 2)  # (BnW,h,Nk,dh)
-        v = v.view(B, Nk, self.h, self.dh).transpose(1, 2)
+        # reshape to SDPA
+        q = q.view(Bwin, Nq, self.h, self.dh).transpose(1, 2)  # [Bwin,h,N,dh]
+        k = k.view(Bwin, Nk, self.h, self.dh).transpose(1, 2)
+        v = v.view(Bwin, Nk, self.h, self.dh).transpose(1, 2)
+
+        # 4) attention mask（只在 shift 时需要）
+        attn_mask = None
+        if use_shift:
+            # 单样本 mask: [nW, N, N]，扩展到 batch: [B0*nW, N, N]
+            mask_1 = self._get_attn_mask(Dp, Hp, Wp, device=q.device, dtype=q.dtype)
+            nW = mask_1.shape[0]
+            mask = mask_1.repeat(B0, 1, 1)  # [B0*nW, N, N]
+            attn_mask = mask.unsqueeze(1)   # [B0*nW, 1, N, N] -> broadcast 到 heads
 
         out = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_mask,
             dropout_p=self.attn_drop if self.training else 0.0,
             is_causal=False
-        )  
+        )  # [Bwin,h,N,dh]
 
-        out = out.transpose(1, 2).contiguous().view(B, Nq, C)  # (BnW,Nq,C)
+        out = out.transpose(1, 2).contiguous().view(Bwin, Nq, C)  # [Bwin,N,C]
         out = self.proj_drop(self.proj(out))
-        out = self._window_reverse(out, shp)
-        return out.permute(0, 4, 1, 2, 3).contiguous()
+
+        # 5) reverse windows -> padded feature
+        out = self._window_reverse_no_pad(out, B0, Dp, Hp, Wp)  # [B0,Dp,Hp,Wp,C]
+
+        # 6) reverse shift + unpad
+        if use_shift:
+            out = torch.roll(out, shifts=(sd, sh, sw), dims=(1, 2, 3))
+
+        out = out[:, :D, :H, :W, :]  
+        return out.permute(0, 4, 1, 2, 3).contiguous()  # [B,C,D,H,W]
 
 
 def recommended_window_attn_config(patch_size: int | Sequence[int] = (96, 96, 96)):
@@ -288,8 +387,8 @@ def recommended_window_attn_config(patch_size: int | Sequence[int] = (96, 96, 96
 
     if tuple(patch_size) == (96, 96, 96):
         return {
-            "skip1": {"num_heads": 4, "window_size": (6, 6, 6)},
-            "skip2": {"num_heads": 4, "window_size": (6, 6, 6)},
+            "skip1": {"num_heads": 4, "window_size": (6, 8, 8)},
+            "skip2": {"num_heads": 4, "window_size": (6, 8, 8)},
             "attn_dropout": 0.0,
             "proj_dropout": 0.1,
         }
@@ -303,7 +402,7 @@ def recommended_window_attn_config(patch_size: int | Sequence[int] = (96, 96, 96
 
 
 class GatedFreqCrossAttn3D(nn.Module):
-    def __init__(self, channels: int, num_heads: int = 8, num_high: int = 7, window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
+    def __init__(self, channels: int, num_heads: int = 8, num_high: int = 7, window_size: Tuple[int, int, int] = (6, 8, 8), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
         super().__init__()
         self.num_high = num_high
 
@@ -317,9 +416,20 @@ class GatedFreqCrossAttn3D(nn.Module):
 
         self.fuse_hi = nn.Conv3d(num_high * channels, channels, kernel_size=1, bias=False)
 
-        self.attn_low = CrossAttention3D(channels, num_heads=num_heads, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout)
+        ws = window_size
+        ss = (ws[0] // 2, ws[1] // 2, ws[2] // 2)
+
+        self.attn_low = CrossAttention3D(
+            channels, num_heads=num_heads,
+            window_size=ws, shift_size=ss,
+            attn_dropout=attn_dropout, proj_dropout=proj_dropout
+        )
         self.attn_high = nn.ModuleList([
-            CrossAttention3D(channels, num_heads=num_heads, window_size=window_size, attn_dropout=attn_dropout, proj_dropout=proj_dropout)
+            CrossAttention3D(
+                channels, num_heads=num_heads,
+                window_size=ws, shift_size=ss,
+                attn_dropout=attn_dropout, proj_dropout=proj_dropout
+            )
             for _ in range(num_high)
         ])
 
@@ -640,7 +750,14 @@ class VNet(nn.Module):
         super(VNet, self).__init__()
         self.num_classes = n_classes
         self.input_layout = input_layout
-        self.encoder = Encoder(n_channels, n_classes, n_filters, normalization, has_dropout, has_residual)
+        self.encoder = Encoder(
+        n_channels=n_channels,
+        n_filters=n_filters,
+        normalization=normalization,
+        has_dropout=has_dropout,
+        has_residual=has_residual
+        )
+
         self.decoder = Decoder(n_classes, n_filters, normalization, has_dropout, has_residual)
 
     def _to_ncdhw(self, x: torch.Tensor) -> torch.Tensor:
