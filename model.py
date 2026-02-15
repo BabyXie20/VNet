@@ -17,13 +17,9 @@ def _best_group_count(num_channels: int, preferred: int = 16) -> int:
 
 
 def norm3d(norm: NormType, num_channels: int, affine: bool = True) -> nn.Module:
-    if norm == "batchnorm":
-        return nn.BatchNorm3d(num_channels)
-    if norm == "groupnorm":
-        num_groups = _best_group_count(num_channels, preferred=16)
+    if norm in ("batchnorm", "groupnorm", "instancenorm"):
+        num_groups = _best_group_count(num_channels, preferred=8)
         return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
-    if norm == "instancenorm":
-        return nn.InstanceNorm3d(num_channels, affine=affine)
     if norm in ("none", None):
         return nn.Identity()
     raise ValueError(f"Unknown normalization: {norm}")
@@ -115,12 +111,8 @@ class ConvBlock(nn.Module):
                 input_channel = n_filters_out
 
             ops.append(nn.Conv3d(input_channel, n_filters_out, 3, padding=1))
-            if normalization == 'batchnorm':
-                ops.append(nn.BatchNorm3d(n_filters_out))
-            elif normalization == 'groupnorm':
-                ops.append(nn.GroupNorm(num_groups=16, num_channels=n_filters_out))
-            elif normalization == 'instancenorm':
-                ops.append(nn.InstanceNorm3d(n_filters_out))
+            if normalization in ('batchnorm', 'groupnorm', 'instancenorm'):
+                ops.append(nn.GroupNorm(num_groups=_best_group_count(n_filters_out, preferred=8), num_channels=n_filters_out))
             elif normalization != 'none':
                 assert False
             ops.append(nn.ReLU(inplace=True))
@@ -144,12 +136,8 @@ class ResidualConvBlock(nn.Module):
                 input_channel = n_filters_out
 
             ops.append(nn.Conv3d(input_channel, n_filters_out, 3, padding=1))
-            if normalization == 'batchnorm':
-                ops.append(nn.BatchNorm3d(n_filters_out))
-            elif normalization == 'groupnorm':
-                ops.append(nn.GroupNorm(num_groups=16, num_channels=n_filters_out))
-            elif normalization == 'instancenorm':
-                ops.append(nn.InstanceNorm3d(n_filters_out))
+            if normalization in ('batchnorm', 'groupnorm', 'instancenorm'):
+                ops.append(nn.GroupNorm(num_groups=_best_group_count(n_filters_out, preferred=8), num_channels=n_filters_out))
             elif normalization != 'none':
                 assert False
 
@@ -172,12 +160,8 @@ class DownsamplingConvBlock(nn.Module):
         ops = []
         if normalization != 'none':
             ops.append(nn.Conv3d(n_filters_in, n_filters_out, stride, padding=0, stride=stride))
-            if normalization == 'batchnorm':
-                ops.append(nn.BatchNorm3d(n_filters_out))
-            elif normalization == 'groupnorm':
-                ops.append(nn.GroupNorm(num_groups=16, num_channels=n_filters_out))
-            elif normalization == 'instancenorm':
-                ops.append(nn.InstanceNorm3d(n_filters_out))
+            if normalization in ('batchnorm', 'groupnorm', 'instancenorm'):
+                ops.append(nn.GroupNorm(num_groups=_best_group_count(n_filters_out, preferred=8), num_channels=n_filters_out))
             else:
                 assert False
         else:
@@ -199,12 +183,8 @@ class UpsamplingDeconvBlock(nn.Module):
         ops = []
         if normalization != 'none':
             ops.append(nn.ConvTranspose3d(n_filters_in, n_filters_out, stride, padding=0, stride=stride))
-            if normalization == 'batchnorm':
-                ops.append(nn.BatchNorm3d(n_filters_out))
-            elif normalization == 'groupnorm':
-                ops.append(nn.GroupNorm(num_groups=16, num_channels=n_filters_out))
-            elif normalization == 'instancenorm':
-                ops.append(nn.InstanceNorm3d(n_filters_out))
+            if normalization in ('batchnorm', 'groupnorm', 'instancenorm'):
+                ops.append(nn.GroupNorm(num_groups=_best_group_count(n_filters_out, preferred=8), num_channels=n_filters_out))
             else:
                 assert False
         else:
@@ -376,7 +356,7 @@ class GatedFreqCrossAttn3D(nn.Module):
     
 
 class CrossDomainBlcok(nn.Module):
-    def __init__(self, c: int, norm: str = "instancenorm"):
+    def __init__(self, c: int, norm: str = "groupnorm"):
         super().__init__()
         inter = c
         self.spa_mlp = nn.Sequential(
@@ -421,7 +401,7 @@ class CrossDomainBlcok(nn.Module):
 
 
 class MFEC(nn.Module):
-    def __init__(self, channels: int, normalization: NormType = "instancenorm", num_experts: int = 5):
+    def __init__(self, channels: int, normalization: NormType = "groupnorm", num_experts: int = 5):
         super().__init__()
         if num_experts != 5:
             raise ValueError("MFEC is configured for 5 organ-aware experts.")
@@ -491,7 +471,7 @@ class MFEC(nn.Module):
 
 
 class SkipRefinement(nn.Module):
-    def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "instancenorm",
+    def __init__(self, c: int, num_heads: int, g2_channels: int, normalization: NormType = "groupnorm",
                  window_size: Tuple[int, int, int] = (6, 6, 6), attn_dropout: float = 0.0, proj_dropout: float = 0.1):
         super().__init__()
         self.dwt = DWT3D()
@@ -655,7 +635,7 @@ class Decoder(nn.Module):
 
 class VNet(nn.Module):
     def __init__(self, n_channels=1, n_classes=14, patch_size=96, n_filters=16,
-                 normalization='instancenorm', has_dropout=False, has_residual=False,
+                 normalization='groupnorm', has_dropout=False, has_residual=False,
                  input_layout: str = "NCHWD"):   
         super(VNet, self).__init__()
         self.num_classes = n_classes
