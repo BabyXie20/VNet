@@ -117,8 +117,9 @@ def parse_args():
     parser.add_argument("--opt_betas", type=float, nargs=2, default=[0.9, 0.999])
     parser.add_argument("--opt_eps", type=float, default=1e-8)
 
-    # PolyLR (per-iteration)
-    parser.add_argument("--use_poly", action="store_true", help="use PolyLR per-iteration")
+    # LR schedule (per-iteration): linear warmup + PolyLR
+    parser.add_argument("--use_poly", action="store_true", help="(deprecated) kept for compatibility")
+    parser.add_argument("--warmup_iters", type=int, default=1000, help="linear warmup iterations")
     parser.add_argument("--poly_power", type=float, default=0.9)
     parser.add_argument("--min_lr", type=float, default=1e-6)
 
@@ -1109,19 +1110,25 @@ def main():
         eps=float(args.opt_eps),
     )
 
-    # PolyLR scheduler (iteration-based)
-    scheduler = None
-    if args.use_poly:
-        base_lr = float(args.lr)
+    # Linear warmup + PolyLR scheduler (iteration-based)
+    base_lr = float(args.lr)
+    warmup_iters = max(0, int(args.warmup_iters))
 
-        def lr_lambda(step: int):
-            # step: 0,1,2,... (per optimizer update)
-            t = min(max(step, 0), int(args.max_iterations))
-            poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
-            # clamp to min_lr
-            return max(float(args.min_lr) / base_lr, poly)
+    def lr_lambda(step: int):
+        # step: 0,1,2,... (per optimizer update)
+        t = min(max(step, 0), int(args.max_iterations))
+        min_ratio = float(args.min_lr) / base_lr
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        if warmup_iters > 0 and t < warmup_iters:
+            warmup_ratio = (t + 1) / float(warmup_iters)
+            return max(min_ratio, warmup_ratio)
+
+        poly_span = max(int(args.max_iterations) - warmup_iters, 1)
+        t_poly = min(max(t - warmup_iters, 0), poly_span)
+        poly = (1.0 - t_poly / float(poly_span)) ** float(args.poly_power)
+        return max(min_ratio, poly)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
     post_label = AsDiscrete(to_onehot=num_classes)
