@@ -100,13 +100,13 @@ def parse_args():
     parser.add_argument("--cache_rate", type=float, default=1.0)
 
     parser.add_argument("--num_workers_train", type=int, default=8)
-    parser.add_argument("--num_workers_val", type=int, default=4)
-    parser.add_argument("--num_workers_test", type=int, default=4)
+    parser.add_argument("--num_workers_val", type=int, default=6)
+    parser.add_argument("--num_workers_test", type=int, default=6)
 
     # train/val schedule (iteration-based)
     parser.add_argument("--max_iterations", type=int, default=32000)
     parser.add_argument("--eval_num", type=int, default=400)
-    parser.add_argument("--val_start_iter", type=int, default=12000, help="start val eval at this iter (inclusive)")
+    parser.add_argument("--val_start_iter", type=int, default=20000, help="start val eval at this iter (inclusive)")
     parser.add_argument("--sw_batch_size", type=int, default=2)
     parser.add_argument("--sw_overlap", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=3, help="keep top-k checkpoints by val foreground Dice")
@@ -197,63 +197,6 @@ def seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % (2**32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-
-class PolyLRScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """Iteration-based polynomial LR decay with floor min_lr.
-
-    Formula:
-        lr_t = max(min_lr, base_lr * (1 - t / max_iterations) ** power)
-    where t is the optimizer update step.
-    """
-
-    def __init__(self, optimizer, max_iterations: int, power: float = 0.9, min_lr: float = 1e-6, last_epoch: int = -1):
-        self.max_iterations = max(1, int(max_iterations))
-        self.power = float(power)
-        self.min_lr = float(min_lr)
-        super().__init__(optimizer, last_epoch=last_epoch)
-
-    def get_lr(self):
-        t = min(max(self.last_epoch, 0), self.max_iterations)
-        factor = (1.0 - float(t) / float(self.max_iterations)) ** self.power
-        return [max(self.min_lr, base_lr * factor) for base_lr in self.base_lrs]
-
-
-def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace):
-    """Build AdamW optimizer and optional PolyLR scheduler."""
-
-    def build_param_groups(m: torch.nn.Module, weight_decay: float):
-        decay, no_decay = [], []
-        for n, p in m.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
-                no_decay.append(p)
-            else:
-                decay.append(p)
-        return [
-            {"params": decay, "weight_decay": float(weight_decay)},
-            {"params": no_decay, "weight_decay": 0.0},
-        ]
-
-    param_groups = build_param_groups(model, weight_decay=args.wd)
-
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=float(args.lr),
-        betas=tuple(args.opt_betas),
-        eps=float(args.opt_eps),
-    )
-
-    scheduler = None
-    if args.use_poly:
-        scheduler = PolyLRScheduler(
-            optimizer,
-            max_iterations=args.max_iterations,
-            power=args.poly_power,
-            min_lr=args.min_lr,
-        )
-    return optimizer, scheduler
 
 
 def safe_float(x: float) -> Optional[float]:
@@ -1143,7 +1086,42 @@ def main():
 
     loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
 
-    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
+    def build_param_groups(m: torch.nn.Module, weight_decay: float):
+        decay, no_decay = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": float(weight_decay)},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    param_groups = build_param_groups(model, weight_decay=args.wd)
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=float(args.lr),
+        betas=tuple(args.opt_betas),
+        eps=float(args.opt_eps),
+    )
+
+    # PolyLR scheduler (iteration-based)
+    scheduler = None
+    if args.use_poly:
+        base_lr = float(args.lr)
+
+        def lr_lambda(step: int):
+            # step: 0,1,2,... (per optimizer update)
+            t = min(max(step, 0), int(args.max_iterations))
+            poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
+            # clamp to min_lr
+            return max(float(args.min_lr) / base_lr, poly)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
     post_label = AsDiscrete(to_onehot=num_classes)
@@ -1212,24 +1190,21 @@ def main():
 
             with autocast(device_type=device.type, enabled=use_amp):
                 out = model(x, return_aux=True)
-                logits, logits_s1, logits_s2, logits_s3 = out
+                logits, logits_s1, logits_s2 = out
 
                 loss_main = loss_function(logits, y)
 
                 y_s1 = F.interpolate(y.float(), size=logits_s1.shape[-3:], mode="nearest").long()
                 y_s2 = F.interpolate(y.float(), size=logits_s2.shape[-3:], mode="nearest").long()
-                y_s3 = F.interpolate(y.float(), size=logits_s3.shape[-3:], mode="nearest").long()
 
                 loss_s1 = loss_function(logits_s1, y_s1)
                 loss_s2 = loss_function(logits_s2, y_s2)
-                loss_s3 = loss_function(logits_s3, y_s3)
-                w_s1, w_s2, w_s3 = 0.2, 0.1, 0.05
-                loss = loss_main + w_s1 * loss_s1 + w_s2 * loss_s2 + w_s3 * loss_s3
+                w_s1, w_s2 = 0.2, 0.1
+                loss = loss_main + w_s1 * loss_s1 + w_s2 * loss_s2
                 
             writer.add_scalar("train/loss_main", float(loss_main.item()), global_step)
             writer.add_scalar("train/loss_s1", float(loss_s1.item()), global_step)
             writer.add_scalar("train/loss_s2", float(loss_s2.item()), global_step)
-            writer.add_scalar("train/loss_s3", float(loss_s3.item()), global_step)
             writer.add_scalar("train/loss_total", float(loss.item()), global_step)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
