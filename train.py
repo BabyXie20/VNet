@@ -1212,21 +1212,24 @@ def main():
 
             with autocast(device_type=device.type, enabled=use_amp):
                 out = model(x, return_aux=True)
-                logits, logits_s1, logits_s2 = out
+                logits, logits_s1, logits_s2, logits_s3 = out
 
                 loss_main = loss_function(logits, y)
 
                 y_s1 = F.interpolate(y.float(), size=logits_s1.shape[-3:], mode="nearest").long()
                 y_s2 = F.interpolate(y.float(), size=logits_s2.shape[-3:], mode="nearest").long()
+                y_s3 = F.interpolate(y.float(), size=logits_s3.shape[-3:], mode="nearest").long()
 
                 loss_s1 = loss_function(logits_s1, y_s1)
                 loss_s2 = loss_function(logits_s2, y_s2)
-                w_s1, w_s2 = 0.2, 0.1
-                loss = loss_main + w_s1 * loss_s1 + w_s2 * loss_s2
+                loss_s3 = loss_function(logits_s3, y_s3)
+                w_s1, w_s2, w_s3 = 0.2, 0.1, 0.05
+                loss = loss_main + w_s1 * loss_s1 + w_s2 * loss_s2 + w_s3 * loss_s3
                 
             writer.add_scalar("train/loss_main", float(loss_main.item()), global_step)
             writer.add_scalar("train/loss_s1", float(loss_s1.item()), global_step)
             writer.add_scalar("train/loss_s2", float(loss_s2.item()), global_step)
+            writer.add_scalar("train/loss_s3", float(loss_s3.item()), global_step)
             writer.add_scalar("train/loss_total", float(loss.item()), global_step)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
