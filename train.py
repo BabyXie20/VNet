@@ -49,10 +49,8 @@ from monai.transforms import (
 )
 import numpy as np
 from networks.model import VNet
+import torch.nn.functional as F
 
-# ----------------------------
-# Class labels
-# ----------------------------
 CLASS_LABELS = {
     "0": "background",
     "1": "spleen",
@@ -106,18 +104,24 @@ def parse_args():
     parser.add_argument("--num_workers_test", type=int, default=4)
 
     # train/val schedule (iteration-based)
-    parser.add_argument("--max_iterations", type=int, default=48000)
+    parser.add_argument("--max_iterations", type=int, default=32000)
     parser.add_argument("--eval_num", type=int, default=400)
-    parser.add_argument("--val_start_iter", type=int, default=16000, help="start val eval at this iter (inclusive)")
+    parser.add_argument("--val_start_iter", type=int, default=12000, help="start val eval at this iter (inclusive)")
     parser.add_argument("--sw_batch_size", type=int, default=2)
     parser.add_argument("--sw_overlap", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=3, help="keep top-k checkpoints by val foreground Dice")
 
     # optim
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)  
     parser.add_argument("--wd", type=float, default=1e-5)
+    parser.add_argument("--opt_betas", type=float, nargs=2, default=[0.9, 0.999])
+    parser.add_argument("--opt_eps", type=float, default=1e-8)
 
-    # early stopping (validation-based, monitor foreground dice)
+    # PolyLR (per-iteration)
+    parser.add_argument("--use_poly", action="store_true", help="use PolyLR per-iteration")
+    parser.add_argument("--poly_power", type=float, default=0.9)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+
     parser.add_argument(
         "--early_stop_patience",
         type=int,
@@ -136,13 +140,6 @@ def parse_args():
         default=0,
         help="ignore early-stop counting for first N validations",
     )
-
-    # ----------------------------
-    # custom split (train/val/test by counts, from labeled pool)
-    # NOTE:
-    #   默认行为：val = test（同一批测试集同时作为验证集）
-    #   如果想三分独立验证集/测试集：加 --val_separate
-    # ----------------------------
     parser.add_argument(
         "--pool_keys",
         type=str,
@@ -165,10 +162,6 @@ def parse_args():
         "If not set (default), val set will be identical to test set.",
     )
     parser.add_argument("--split_seed", type=int, default=123, help="seed for deterministic split shuffling")
-
-    # ----------------------------
-    # exclude cases before splitting (DEFAULT: do not exclude)
-    # ----------------------------
     parser.add_argument(
         "--exclude_cases",
         type=str,
@@ -176,10 +169,6 @@ def parse_args():
         default=[],
         help="exclude these case ids before splitting (e.g. 0008). default: [] (no exclusion)",
     )
-
-    # ----------------------------
-    # code snapshot (save script + extra dirs into output_dir/snapshot)
-    # ----------------------------
     parser.add_argument(
         "--snapshot_extra",
         type=str,
@@ -188,7 +177,6 @@ def parse_args():
         help="extra relative paths (dirs/files) to snapshot into outputs (e.g. networks configs).",
     )
 
-    # misc
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--amp", action="store_true", help="use mixed precision")
     parser.add_argument("--cudnn_benchmark", action="store_true", help="torch.backends.cudnn.benchmark=True")
@@ -235,9 +223,6 @@ def get_class_names(num_classes: int) -> List[str]:
     return names
 
 
-# ----------------------------
-# code snapshot helpers
-# ----------------------------
 def _safe_run_cmd(cmd: List[str], cwd: Optional[str] = None, timeout: int = 5) -> Tuple[int, str, str]:
     try:
         p = subprocess.run(
@@ -1100,7 +1085,44 @@ def main():
     model = VNet(n_channels=1, n_classes=num_classes).to(device)
 
     loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+
+    def build_param_groups(m: torch.nn.Module, weight_decay: float):
+        decay, no_decay = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": float(weight_decay)},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    param_groups = build_param_groups(model, weight_decay=args.wd)
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=float(args.lr),
+        betas=tuple(args.opt_betas),
+        eps=float(args.opt_eps),
+    )
+
+    # PolyLR scheduler (iteration-based)
+    scheduler = None
+    if args.use_poly:
+        base_lr = float(args.lr)
+
+        def lr_lambda(step: int):
+            # step: 0,1,2,... (per optimizer update)
+            t = min(max(step, 0), int(args.max_iterations))
+            poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
+            # clamp to min_lr
+            return max(float(args.min_lr) / base_lr, poly)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
 
     post_label = AsDiscrete(to_onehot=num_classes)
     post_pred = AsDiscrete(argmax=True, to_onehot=num_classes)
@@ -1108,9 +1130,6 @@ def main():
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
 
-    # ----------------------------
-    # Top-k checkpoint manager
-    # ----------------------------
     topk = max(1, int(args.topk))
     topk_dir = os.path.join(output_dir, f"top{topk}")
     os.makedirs(topk_dir, exist_ok=True)
@@ -1144,9 +1163,6 @@ def main():
                 indent=2,
             )
 
-    # ----------------------------
-    # Train loop + Early Stop
-    # ----------------------------
     global_step = 0
     best_val_dice_fg = -1.0
     best_step = -1
@@ -1173,12 +1189,29 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                logits = model(x)
-                loss = loss_function(logits, y)
+                out = model(x, return_aux=True)
+                logits, logits_s1, logits_s2 = out
 
+                loss_main = loss_function(logits, y)
+
+                y_s1 = F.interpolate(y.float(), size=logits_s1.shape[-3:], mode="nearest").long()
+                y_s2 = F.interpolate(y.float(), size=logits_s2.shape[-3:], mode="nearest").long()
+
+                loss_s1 = loss_function(logits_s1, y_s1)
+                loss_s2 = loss_function(logits_s2, y_s2)
+                w_s1, w_s2 = 0.2, 0.1
+                loss = loss_main + w_s1 * loss_s1 + w_s2 * loss_s2
+                
+            writer.add_scalar("train/loss_main", float(loss_main.item()), global_step)
+            writer.add_scalar("train/loss_s1", float(loss_s1.item()), global_step)
+            writer.add_scalar("train/loss_s2", float(loss_s2.item()), global_step)
+            writer.add_scalar("train/loss_total", float(loss.item()), global_step)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+
+            if scheduler is not None:
+                scheduler.step()
 
             global_step += 1
             pbar.update(1)
@@ -1188,9 +1221,6 @@ def main():
             writer.add_scalar("train/lr", float(lr_now), global_step)
             pbar.set_description(f"Training iter={global_step}/{args.max_iterations} loss={loss.item():.5f}")
 
-            # ----------------------------
-            # NEW: skip val evaluation before val_start_iter
-            # ----------------------------
             do_eval_now = ((global_step % args.eval_num == 0) or (global_step == args.max_iterations))
             if do_eval_now and (global_step >= int(args.val_start_iter)):
                 prev_best = float(best_val_dice_fg)
@@ -1273,9 +1303,6 @@ def main():
     if stop_training:
         print(f"Stopped early at iter={global_step}. Reason: {early_stop_reason}")
 
-    # ----------------------------
-    # Test evaluation using TOP-K ensemble + print per-case dice
-    # ----------------------------
     test_metrics: Dict[str, Any] = {}
 
     ckpt_paths = [p for (_, _, p) in topk_list if os.path.isfile(p)]
