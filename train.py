@@ -199,6 +199,63 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+class PolyLRScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Iteration-based polynomial LR decay with floor min_lr.
+
+    Formula:
+        lr_t = max(min_lr, base_lr * (1 - t / max_iterations) ** power)
+    where t is the optimizer update step.
+    """
+
+    def __init__(self, optimizer, max_iterations: int, power: float = 0.9, min_lr: float = 1e-6, last_epoch: int = -1):
+        self.max_iterations = max(1, int(max_iterations))
+        self.power = float(power)
+        self.min_lr = float(min_lr)
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def get_lr(self):
+        t = min(max(self.last_epoch, 0), self.max_iterations)
+        factor = (1.0 - float(t) / float(self.max_iterations)) ** self.power
+        return [max(self.min_lr, base_lr * factor) for base_lr in self.base_lrs]
+
+
+def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace):
+    """Build AdamW optimizer and optional PolyLR scheduler."""
+
+    def build_param_groups(m: torch.nn.Module, weight_decay: float):
+        decay, no_decay = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": float(weight_decay)},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    param_groups = build_param_groups(model, weight_decay=args.wd)
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=float(args.lr),
+        betas=tuple(args.opt_betas),
+        eps=float(args.opt_eps),
+    )
+
+    scheduler = None
+    if args.use_poly:
+        scheduler = PolyLRScheduler(
+            optimizer,
+            max_iterations=args.max_iterations,
+            power=args.poly_power,
+            min_lr=args.min_lr,
+        )
+    return optimizer, scheduler
+
+
 def safe_float(x: float) -> Optional[float]:
     if x is None:
         return None
@@ -1086,42 +1143,7 @@ def main():
 
     loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
 
-    def build_param_groups(m: torch.nn.Module, weight_decay: float):
-        decay, no_decay = [], []
-        for n, p in m.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
-                no_decay.append(p)
-            else:
-                decay.append(p)
-        return [
-            {"params": decay, "weight_decay": float(weight_decay)},
-            {"params": no_decay, "weight_decay": 0.0},
-        ]
-
-    param_groups = build_param_groups(model, weight_decay=args.wd)
-
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=float(args.lr),
-        betas=tuple(args.opt_betas),
-        eps=float(args.opt_eps),
-    )
-
-    # PolyLR scheduler (iteration-based)
-    scheduler = None
-    if args.use_poly:
-        base_lr = float(args.lr)
-
-        def lr_lambda(step: int):
-            # step: 0,1,2,... (per optimizer update)
-            t = min(max(step, 0), int(args.max_iterations))
-            poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
-            # clamp to min_lr
-            return max(float(args.min_lr) / base_lr, poly)
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
 
 
     post_label = AsDiscrete(to_onehot=num_classes)
