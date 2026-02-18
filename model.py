@@ -11,8 +11,8 @@ NormType = Optional[Literal["batchnorm", "groupnorm", "instancenorm", "none"]]
 
 def predictive_entropy_from_logits(logits: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     p = torch.softmax(logits, dim=1)
-    ent = -(p * torch.log(p.clamp_min(eps))).sum(dim=1, keepdim=True)  
-    ent = ent / math.log(p.shape[1])  
+    ent = -(p * torch.log(p.clamp_min(eps))).sum(dim=1, keepdim=True)
+    ent = ent / math.log(p.shape[1])
     return ent
 
 
@@ -52,8 +52,8 @@ def _build_haar_3d_kernels(device):
     for zf in [L, H]:
         for yf in [L, H]:
             for xf in [L, H]:
-                taps.append(_kron3(zf, yf, xf))  # [2, 2, 2]
-    k = torch.stack(taps, dim=0)[:, None, ...]  # [8, 1, 2, 2, 2]
+                taps.append(_kron3(zf, yf, xf))
+    k = torch.stack(taps, dim=0)[:, None, ...]
     stride = (2, 2, 2)
     ksize = (2, 2, 2)
     return k.to(device), stride, ksize
@@ -63,22 +63,23 @@ class DWT3D(nn.Module):
     def __init__(self):
         super().__init__()
         k, stride, ksize = _build_haar_3d_kernels(device=torch.device('cpu'))
-        # k: [8, 1, 2, 2, 2]
-        self.register_buffer("kernels", k)  
-        self.stride = stride                 
-        self.ksize = ksize                   
+
+        self.register_buffer("kernels", k)
+        self.stride = stride
+        self.ksize = ksize
 
     def forward(self, x: torch.Tensor):
+        # in: x [B,C,D,H,W]; out: low [B,C,D/2,H/2,W/2], highs [B,C,7,D/2,H/2,W/2]
         B, C, D, H, W = x.shape
-        S = self.kernels.shape[0]           # 8
-        # [C*8, 1, 2,2,2]
+        S = self.kernels.shape[0]
+
         weight = self.kernels.repeat(C, 1, 1, 1, 1)
 
         y = F.conv3d(x, weight, stride=self.stride, padding=0, groups=C)
 
-        y = y.view(B, C, S, *y.shape[-3:])  # [B, C, 8, D/2, H/2, W/2]
-        low = y[:, :, :1, ...].squeeze(2)   # [B, C, D/2, H/2, W/2]
-        highs = y[:, :, 1:, ...]            # [B, C, 7, D/2, H/2, W/2]
+        y = y.view(B, C, S, *y.shape[-3:])
+        low = y[:, :, :1, ...].squeeze(2)
+        highs = y[:, :, 1:, ...]
         return low, highs
 
 
@@ -86,22 +87,23 @@ class IDWT3D(nn.Module):
     def __init__(self):
         super().__init__()
         k, stride, ksize = _build_haar_3d_kernels(device=torch.device('cpu'))
-        self.register_buffer("kernels", k)   # [8, 1, 2, 2, 2]
+        self.register_buffer("kernels", k)
         self.stride = stride
         self.ksize = ksize
 
     def forward(self, low: torch.Tensor, highs: torch.Tensor):
+        # in: low [B,C,D/2,H/2,W/2], highs [B,C,7,D/2,H/2,W/2]; out: x [B,C,D,H,W]
         B, C, Dp, Hp, Wp = low.shape
-        S = self.kernels.shape[0]        
+        S = self.kernels.shape[0]
 
-        y = torch.cat([low.unsqueeze(2), highs], dim=2)  
-        y = y.view(B, C * S, Dp, Hp, Wp)                 
+        y = torch.cat([low.unsqueeze(2), highs], dim=2)
+        y = y.view(B, C * S, Dp, Hp, Wp)
 
-        weight = self.kernels.repeat(C, 1, 1, 1, 1)      
+        weight = self.kernels.repeat(C, 1, 1, 1, 1)
 
         x = F.conv_transpose3d(y, weight,stride=self.stride,padding=0,output_padding=0,groups=C)
-        return x  
-    
+        return x
+
 
 class ConvBlock(nn.Module):
     def __init__(self, n_stages, n_filters_in, n_filters_out, normalization='none'):
@@ -128,6 +130,7 @@ class ConvBlock(nn.Module):
         self.conv = nn.Sequential(*ops)
 
     def forward(self, x):
+        # in: x [B,Cin,D,H,W]; out: y [B,Cout,D,H,W]
         x = self.conv(x)
         return x
 
@@ -160,6 +163,7 @@ class ResidualConvBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
+        # in: x [B,Cin,D,H,W]; out: y [B,Cout,D,H,W]
         x = (self.conv(x) + x)
         x = self.relu(x)
         return x
@@ -188,6 +192,7 @@ class DownsamplingConvBlock(nn.Module):
         self.conv = nn.Sequential(*ops)
 
     def forward(self, x):
+        # in: x [B,Cin,D,H,W]; out: y [B,Cout,D/stride,H/stride,W/stride]
         x = self.conv(x)
         return x
 
@@ -216,6 +221,7 @@ class UpsamplingDeconvBlock(nn.Module):
         self.conv = nn.Sequential(*ops)
 
     def forward(self, x):
+        # in: x [B,Cin,D,H,W]; out: y [B,Cout,D*stride,H*stride,W*stride]
         x = self.conv(x)
         return x
 
@@ -247,6 +253,7 @@ class DW_PW_1x1x1(nn.Module):
         self.pw = nn.Conv3d(channels, channels, kernel_size=1, groups=1, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # in: x [B,C,D,H,W]; out: y [B,C,D,H,W]
         return self.pw(self.dw(x))
 
 
@@ -273,7 +280,7 @@ class CrossAttention3D(nn.Module):
         self.attn_drop = attn_dropout
 
     def _window_partition(self, x: torch.Tensor):
-        # x: [B, D, H, W, C]
+
         B, D, H, W, C = x.shape
         wd, wh, ww = self.window_size
 
@@ -298,7 +305,8 @@ class CrossAttention3D(nn.Module):
         return x[:, :D, :H, :W, :]
 
     def forward(self, q_map, k_map, v_map):
-        q_map = q_map.permute(0, 2, 3, 4, 1).contiguous()  # [B,D,H,W,C]
+        # in: q_map/k_map/v_map [B,C,D,H,W]; out: y [B,C,D,H,W]
+        q_map = q_map.permute(0, 2, 3, 4, 1).contiguous()
         k_map = k_map.permute(0, 2, 3, 4, 1).contiguous()
         v_map = v_map.permute(0, 2, 3, 4, 1).contiguous()
 
@@ -313,8 +321,8 @@ class CrossAttention3D(nn.Module):
         B, Nq, C = q.shape
         Nk = k.shape[1]
 
-        q = q.view(B, Nq, self.h, self.dh).transpose(1, 2)  # (BnW,h,Nq,dh)
-        k = k.view(B, Nk, self.h, self.dh).transpose(1, 2)  # (BnW,h,Nk,dh)
+        q = q.view(B, Nq, self.h, self.dh).transpose(1, 2)
+        k = k.view(B, Nk, self.h, self.dh).transpose(1, 2)
         v = v.view(B, Nk, self.h, self.dh).transpose(1, 2)
 
         out = F.scaled_dot_product_attention(
@@ -323,7 +331,7 @@ class CrossAttention3D(nn.Module):
             is_causal=False
         )
 
-        out = out.transpose(1, 2).contiguous().view(B, Nq, C)  # (BnW,Nq,C)
+        out = out.transpose(1, 2).contiguous().view(B, Nq, C)
         out = self.proj_drop(self.proj(out))
         out = self._window_reverse(out, shp)
         return out.permute(0, 4, 1, 2, 3).contiguous()
@@ -402,6 +410,7 @@ class UncGuidedWindowFFTEenhance3D(nn.Module):
         return basis / basis.sum(dim=0, keepdim=True).clamp_min(self.eps)
 
     def forward(self, low: torch.Tensor, gate_dec: torch.Tensor, unc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # in: low/gate_dec [B,C,D,H,W], unc [B,1,D,H,W]|None; out: low_fft [B,C,D,H,W]
         B, C, D, H, W = low.shape
         unc = torch.zeros((B, 1, D, H, W), device=low.device, dtype=low.dtype) if unc is None else unc.clamp(0.0, 1.0)
 
@@ -451,7 +460,7 @@ class GatedFreqCrossAttn3D(nn.Module):
             window_size=window_size,
             band_edges=fft_band_edges,
             hidden=hidden,
-            init_gamma=0.0,    
+            init_gamma=0.0,
         )
 
         self.hf_embed = nn.Parameter(torch.zeros(num_high, channels))
@@ -491,6 +500,7 @@ class GatedFreqCrossAttn3D(nn.Module):
         gate_dec: torch.Tensor,
         unc: Optional[torch.Tensor] = None,
     ):
+        # in: low [B,C,D,H,W], highs [B,C,7,D,H,W], gate_dec [B,C,D,H,W], unc [B,1,D,H,W]|None; out: low_out [B,C,D,H,W], highs_out [B,C,7,D,H,W]
         B, C, D, H, W = low.shape
 
         low = self.fft_enh(low, gate_dec=gate_dec, unc=unc)
@@ -500,7 +510,7 @@ class GatedFreqCrossAttn3D(nn.Module):
             hi = highs[:, :, i, ...] + self.hf_embed[i].view(1, C, 1, 1, 1)
             highs_list.append(hi)
 
-        f = self.fuse_hi(torch.cat(highs_list, dim=1))  # [B,C,D,H,W]
+        f = self.fuse_hi(torch.cat(highs_list, dim=1))
 
         q_low = self.q_low(low)
         k_low = self.k_low(low)
@@ -527,10 +537,10 @@ class GatedFreqCrossAttn3D(nn.Module):
             alpha_hi = self.gate_high(torch.cat([highs_list[i], gate_dec], dim=1))
             highs_out.append(highs_list[i] + (alpha_hi * scale) * delta_hi)
 
-        highs_out = torch.stack(highs_out, dim=2)  # [B,C,num_high,D,H,W]
+        highs_out = torch.stack(highs_out, dim=2)
         return low_out, highs_out
 
-    
+
 class CrossDomainBlcok(nn.Module):
     def __init__(self, c: int, norm: str = "instancenorm"):
         super().__init__()
@@ -563,6 +573,7 @@ class CrossDomainBlcok(nn.Module):
         return torch.cat([avg_stat, max_stat], dim=1)
 
     def forward(self, x_spa: torch.Tensor, x_fre: torch.Tensor) -> torch.Tensor:
+        # in: x_spa/x_fre [B,C,D,H,W]; out: y [B,C,D,H,W]
         w_spa = self.spa_mlp(self._dual_stats(x_spa))
         w_fre = self.fre_mlp(self._dual_stats(x_fre))
 
@@ -629,12 +640,13 @@ class MFEC(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # in: x [B,C,D,H,W]; out: y [B,C,D,H,W]
         avg = self.avgpool(x)
         mx  = self.maxpool(x)
-        mn  = -self.maxpool(-x)  
+        mn  = -self.maxpool(-x)
 
-        g = torch.cat([avg, mx, mn], dim=1)          # [B, 3C, 1, 1, 1]
-        weights = torch.softmax(self.gate(g), dim=1) # [B, E, 1, 1, 1]
+        g = torch.cat([avg, mx, mn], dim=1)
+        weights = torch.softmax(self.gate(g), dim=1)
 
         weighted_expert_outs = []
         for idx, expert in enumerate(self.experts):
@@ -642,7 +654,7 @@ class MFEC(nn.Module):
             y = y * weights[:, idx:idx + 1]
             weighted_expert_outs.append(y)
 
-        y = torch.cat(weighted_expert_outs, dim=1)  # [B, E*C, D, H, W]
+        y = torch.cat(weighted_expert_outs, dim=1)
         y = self.fuse(y)
         return x + y
 
@@ -666,11 +678,12 @@ class SkipRefinement(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, g2: torch.Tensor, unc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # in: x [B,C,D,H,W], g2 [B,Cg,2D,2H,2W], unc [B,1,D,H,W]|None; out: y [B,C,D,H,W]
         x_spa = self.spa(x)
-        low, highs = self.dwt(x)          
+        low, highs = self.dwt(x)
         g2 = self.g2_proj(g2)
 
-        low2, highs2 = self.fre(low, highs, g2, unc=unc)  
+        low2, highs2 = self.fre(low, highs, g2, unc=unc)
         x_fre = self.idwt(low2, highs2)
 
         out = self.fuse(x_spa, x_fre)
@@ -700,6 +713,7 @@ class Encoder(nn.Module):
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
     def forward(self, input):
+        # in: input [B,C,D,H,W]; out: [x1,x2,x3,x4,x5]=[[B,f,D,H,W],[B,2f,D/2,H/2,W/2],[B,4f,D/4,H/4,W/4],[B,8f,D/8,H/8,W/8],[B,16f,D/16,H/16,W/16]]
         x1 = self.block_one(input)
         x1_dw = self.block_one_dw(x1)
 
@@ -743,9 +757,9 @@ class Decoder(nn.Module):
         self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
 
-        self.aux_skip2 = nn.Conv3d(n_filters * 4, n_classes, 1, padding=0)  # from x6_up (24^3)
-        self.aux_skip1 = nn.Conv3d(n_filters * 2, n_classes, 1, padding=0)  # from x7_up (48^3)
-        
+        self.aux_skip2 = nn.Conv3d(n_filters * 4, n_classes, 1, padding=0)
+        self.aux_skip1 = nn.Conv3d(n_filters * 2, n_classes, 1, padding=0)
+
         if attn_cfg is None:
             attn_cfg = recommended_window_attn_config((96, 96, 96))
 
@@ -777,6 +791,7 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
     def forward(self, features, return_aux: bool = False):
+        # in: features=[x1,x2,x3,x4,x5]; out: out_seg [B,K,D,H,W] | (out_seg [B,K,D,H,W], logits_s1 [B,K,D/2,H/2,W/2], logits_s2 [B,K,D/4,H/4,W/4])
         x1, x2, x3, x4, x5 = features
 
         x5_up = self.block_five_up(x5)
@@ -786,16 +801,16 @@ class Decoder(nn.Module):
         x6_up = self.block_six_up(x6)
         x6_up = x6_up + x3
 
-        logits_s2 = self.aux_skip2(x6_up)  # [B,K,24,24,24]
+        logits_s2 = self.aux_skip2(x6_up)
         with torch.no_grad():
-            unc_s2 = predictive_entropy_from_logits(logits_s2)  # [B,1,24,24,24]
+            unc_s2 = predictive_entropy_from_logits(logits_s2)
 
         x7 = self.block_seven(x6_up)
-        x7_up = self.block_seven_up(x7)  # [B,32,48,48,48]
+        x7_up = self.block_seven_up(x7)
 
-        logits_s1 = self.aux_skip1(x7_up)  # [B,K,48,48,48]
+        logits_s1 = self.aux_skip1(x7_up)
         with torch.no_grad():
-            unc_s1 = predictive_entropy_from_logits(logits_s1)  # [B,1,48,48,48]
+            unc_s1 = predictive_entropy_from_logits(logits_s1)
 
         x2 = self.skip2(x2, x6_up, unc_s2)
         x7_up = x7_up + x2
@@ -810,7 +825,7 @@ class Decoder(nn.Module):
         if self.has_dropout:
             x9 = self.dropout(x9)
 
-        out_seg = self.out_conv(x9)  
+        out_seg = self.out_conv(x9)
 
         if return_aux:
             return out_seg, logits_s1, logits_s2
@@ -820,7 +835,7 @@ class Decoder(nn.Module):
 class VNet(nn.Module):
     def __init__(self, n_channels=1, n_classes=14, patch_size=96, n_filters=16,
                  normalization='instancenorm', has_dropout=False, has_residual=False,
-                 input_layout: str = "NCHWD"):   
+                 input_layout: str = "NCHWD"):
         super(VNet, self).__init__()
         self.num_classes = n_classes
         self.input_layout = input_layout
@@ -829,15 +844,16 @@ class VNet(nn.Module):
 
     def _to_ncdhw(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_layout.upper() == "NCHWD":
-            return x.permute(0, 1, 4, 2, 3).contiguous()  
-        return x 
+            return x.permute(0, 1, 4, 2, 3).contiguous()
+        return x
 
     def _to_nchwd(self, y: torch.Tensor) -> torch.Tensor:
         if self.input_layout.upper() == "NCHWD":
-            return y.permute(0, 1, 3, 4, 2).contiguous()  
+            return y.permute(0, 1, 3, 4, 2).contiguous()
         return y
 
     def forward(self, input: torch.Tensor, return_aux: bool = False):
+        # in: input [B,C,H,W,D] | [B,C,D,H,W]; out: out_seg [B,K,H,W,D] | [B,K,D,H,W] | (out_seg, logits_s1, logits_s2)
         x = self._to_ncdhw(input)
         features = self.encoder(x)
         out = self.decoder(features, return_aux=return_aux)
